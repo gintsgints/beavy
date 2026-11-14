@@ -1,6 +1,7 @@
 # Beavy Tanks
 
-Hot-seat, turn-based 2D tank strategy built with [Bevy](https://bevyengine.org).
+Turn-based 2D tank strategy built with [Bevy](https://bevyengine.org). Play hot-seat on one
+machine or online through a small game server.
 
 ## Run
 
@@ -13,6 +14,22 @@ with +/- buttons or keyboard (arrows = width/height, +/- = players, S = reroll s
 Enter = start). Press `M` during a match to return to the menu.
 
 CLI flags prefill the menu: `--players N --width N --height N --seed N`.
+
+## Play online
+
+One machine runs the server (no window, no GPU needed):
+
+```sh
+cargo run --release -- --serve 0.0.0.0:7777
+```
+
+Each player runs the client, picks **Host** or **Join** in the menu, types the server
+address and a name, and either opens a room (a 4-letter code is shown while waiting)
+or enters a code. The match starts when every seat is taken. Only the current player
+can act; the server validates every move and relays it to the others. A player who
+disconnects resigns.
+
+Shortcuts: `--connect HOST:PORT --name NAME --host` or `--join CODE` connect immediately.
 
 ## Rules
 
@@ -31,5 +48,7 @@ CLI flags prefill the menu: `--players N --width N --height N --seed N`.
 
 ## Layout
 
-- `src/game.rs` — pure rules, no Bevy. Unit tested (`cargo test`). Reusable by a future network server.
-- `src/main.rs` — Bevy rendering, input and HUD.
+- `src/game.rs` — pure rules, no Bevy. Unit tested (`cargo test`). Shared by server and clients.
+- `src/net.rs` — wire protocol (JSON lines over TCP), room/lobby logic, client socket. Unit tested.
+- `src/server.rs` — headless TCP server (`--serve`).
+- `src/main.rs` — Bevy rendering, menu, input and HUD.

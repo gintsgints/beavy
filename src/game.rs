@@ -1,6 +1,7 @@
-//! Pure game rules. No Bevy dependency, so the logic is unit-testable and can be
-//! reused unchanged by a networked server later.
+//! Pure game rules. No Bevy dependency, so the logic is unit-testable and is
+//! shared unchanged by the networked server and every client.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ impl Pos {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Dir {
     Up,
     Down,
@@ -66,7 +67,8 @@ pub struct Player {
 }
 
 /// What a player may do on their turn. Exactly one action ends the turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// This is the only rules type that crosses the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Move { unit: u32, dir: Dir },
     Produce,
@@ -400,6 +402,23 @@ impl Game {
             }
         }
         Ok(outcome)
+    }
+
+    /// Take `player` out of the match (surrender or lost connection). Their
+    /// tanks vanish; if it was their turn, play passes on. A no-op for players
+    /// already out or once the game has a result.
+    pub fn resign(&mut self, player: usize) {
+        if self.result.is_some() || !self.players.get(player).is_some_and(|p| p.alive) {
+            return;
+        }
+        self.players[player].alive = false;
+        self.units.retain(|u| u.owner != player);
+        self.log
+            .push(format!("{} left the game.", self.players[player].name));
+        self.check_victory();
+        if self.result.is_none() && self.current == player {
+            self.advance_turn();
+        }
     }
 
     fn eliminate(&mut self, victim: usize, by: usize) {
@@ -831,5 +850,35 @@ mod tests {
         g.apply(Action::Pass).unwrap();
         assert_eq!(g.current, 0);
         assert_eq!(g.turn, 2);
+    }
+
+    #[test]
+    fn resign_removes_tanks_and_passes_turn() {
+        let mut g = Game::new(8, 8, 3, 5);
+        assert_eq!(g.current, 0);
+        g.resign(0);
+        assert!(!g.players[0].alive);
+        assert!(g.units.iter().all(|u| u.owner != 0));
+        assert_eq!(g.current, 1);
+        assert!(g.result.is_none());
+    }
+
+    #[test]
+    fn resign_off_turn_keeps_current_player() {
+        let mut g = Game::new(8, 8, 3, 5);
+        g.resign(2);
+        assert_eq!(g.current, 0);
+        assert!(!g.players[2].alive);
+    }
+
+    #[test]
+    fn resign_of_last_opponent_ends_game() {
+        let mut g = Game::new(8, 8, 2, 5);
+        g.resign(1);
+        assert_eq!(g.result, Some(GameOver::Winner(0)));
+        // Further resignations and actions are rejected.
+        g.resign(0);
+        assert_eq!(g.result, Some(GameOver::Winner(0)));
+        assert_eq!(g.apply(Action::Pass), Err(ActionError::GameOver));
     }
 }

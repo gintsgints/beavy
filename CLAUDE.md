@@ -5,8 +5,11 @@ Hot-seat turn-based tank strategy on Bevy 0.16. Rust 2021.
 ## Layout
 
 - `src/game.rs` — pure rules, no Bevy imports. All gameplay logic and its unit tests live here.
-- `src/main.rs` — Bevy only: states (Menu / Playing), rendering, input, HUD.
-- Keep that split. New rules go in `game.rs` with a test; `main.rs` only translates input to `game::Action` and draws state.
+- `src/net.rs` — online protocol (`ClientMsg`/`ServerMsg`, JSON lines), `Room`/`Lobby` seating rules, `Client` socket wrapper. No Bevy. Unit tested.
+- `src/server.rs` — headless TCP server behind `--serve ADDR`. Only moves bytes; no rules here.
+- `src/main.rs` — Bevy only: states (Menu / Waiting / Playing), rendering, input, HUD.
+- Keep that split. New rules go in `game.rs` with a test; room rules go in `net.rs` with a test; `main.rs` only translates input to `game::Action` and draws state.
+- Online play is lockstep: server owns the `Game`, broadcasts accepted `Action`s only; clients rebuild the board from the shared seed. Never serialize board state.
 
 ## Mandatory after every code change
 

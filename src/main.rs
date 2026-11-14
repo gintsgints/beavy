@@ -1,11 +1,16 @@
 //! Bevy front end: menu to configure a match, then the board. Turns input into
-//! `game::Action`s. Hot-seat multiplayer: all players share one window.
+//! `game::Action`s. Hot-seat (everyone shares one window) or online: each
+//! player runs a client, one machine runs `beavy --serve ADDR`.
 
 mod game;
+mod net;
+mod server;
 
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use game::{Action, Dir, Game, GameOver, Pos, Terrain};
+use net::{Client, ClientMsg, Event, MatchSettings, ServerMsg};
 use std::fmt::Write as _;
 
 const CELL: f32 = 48.0;
@@ -14,7 +19,7 @@ const HUD_H: f32 = 115.0;
 const MARGIN: f32 = 24.0;
 const MIN_WIN_W: f32 = 760.0;
 const MENU_W: f32 = 760.0;
-const MENU_H: f32 = 520.0;
+const MENU_H: f32 = 700.0;
 
 const MIN_PLAYERS: usize = 2;
 const MAX_PLAYERS: usize = 8;
@@ -27,12 +32,42 @@ const MAX_H: i32 = 30;
 // Settings (prefilled from the command line, edited in the menu)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Everyone at one keyboard.
+    Local,
+    /// Open a room on the server and wait for the others.
+    Host,
+    /// Enter a room code someone else is hosting.
+    Join,
+}
+
 #[derive(Resource, Clone)]
 struct Settings {
     players: usize,
     width: i32,
     height: i32,
     seed: u64,
+    mode: Mode,
+    /// Server address for Host/Join.
+    addr: String,
+    /// Name shown to other players online.
+    name: String,
+    /// Room code for Join.
+    code: String,
+    /// `--host` / `--join` on the command line: connect without waiting for Enter.
+    autostart: bool,
+}
+
+impl Settings {
+    fn match_settings(&self) -> MatchSettings {
+        MatchSettings {
+            width: self.width,
+            height: self.height,
+            players: self.players,
+            seed: self.seed,
+        }
+    }
 }
 
 fn now_seed() -> u64 {
@@ -41,12 +76,23 @@ fn now_seed() -> u64 {
         .map_or(1, |d| d.as_secs())
 }
 
-fn parse_args() -> Settings {
+/// Either run the headless server or start the client with these settings.
+enum Launch {
+    Client(Settings),
+    Serve(String),
+}
+
+fn parse_args() -> Launch {
     let mut cfg = Settings {
         players: 3,
         width: 16,
         height: 12,
         seed: now_seed() % 100_000,
+        mode: Mode::Local,
+        addr: net::DEFAULT_ADDR.to_string(),
+        name: String::new(),
+        code: String::new(),
+        autostart: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -57,8 +103,26 @@ fn parse_args() -> Settings {
             ("--width" | "-w", Some(v)) => cfg.width = v.parse().expect("--width N"),
             ("--height" | "-h", Some(v)) => cfg.height = v.parse().expect("--height N"),
             ("--seed" | "-s", Some(v)) => cfg.seed = v.parse().expect("--seed N"),
+            ("--serve", Some(v)) => return Launch::Serve(v.clone()),
+            ("--connect" | "-c", Some(v)) => cfg.addr.clone_from(v),
+            ("--name" | "-n", Some(v)) => cfg.name.clone_from(v),
+            ("--host", _) => {
+                cfg.mode = Mode::Host;
+                cfg.autostart = true;
+                i += 1;
+                continue;
+            }
+            ("--join" | "-j", Some(v)) => {
+                cfg.mode = Mode::Join;
+                cfg.code = v.to_ascii_uppercase();
+                cfg.autostart = true;
+            }
             ("--help", _) => {
-                println!("usage: beavy [--players N] [--width N] [--height N] [--seed N]");
+                println!(
+                    "usage: beavy [--players N] [--width N] [--height N] [--seed N]\n\
+                     \x20      [--connect HOST:PORT] [--name NAME] [--host | --join CODE]\n\
+                     \x20      beavy --serve HOST:PORT   (run a game server)"
+                );
                 std::process::exit(0);
             }
             (other, _) => {
@@ -69,7 +133,7 @@ fn parse_args() -> Settings {
         i += 2;
     }
     cfg.clamp();
-    cfg
+    Launch::Client(cfg)
 }
 
 impl Settings {
@@ -90,6 +154,8 @@ impl Settings {
 enum AppState {
     #[default]
     Menu,
+    /// Online: connected, waiting for the room to fill.
+    Waiting,
     Playing,
     /// One-frame hop used to rebuild the board with the same settings.
     Restart,
@@ -100,6 +166,37 @@ struct GameRes(Game);
 
 #[derive(Resource, Default)]
 struct Selected(Option<u32>);
+
+/// Live server connection plus what it told us. Present only when online.
+#[derive(Resource)]
+struct Net {
+    client: Client,
+    code: String,
+    /// Our seat, known once the server says `Joined`.
+    slot: Option<usize>,
+    settings: MatchSettings,
+    roster: Vec<Option<String>>,
+    /// Set once the socket died; input is then disabled.
+    lost: Option<String>,
+}
+
+/// One-line message under the menu (connection errors and the like).
+#[derive(Resource, Default)]
+struct MenuStatus(String);
+
+/// Which text field receives typed characters.
+#[derive(Resource, Default)]
+struct Focus(Option<TextKind>);
+
+/// Everything spawned for the waiting screen; despawned when leaving it.
+#[derive(Component)]
+struct WaitingEntity;
+
+#[derive(Component)]
+struct WaitingText;
+
+#[derive(Component)]
+struct StatusText;
 
 /// Everything spawned for one match; despawned when leaving `Playing`.
 #[derive(Component)]
@@ -144,10 +241,29 @@ enum Field {
     Seed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextKind {
+    Addr,
+    Name,
+    Code,
+}
+
+impl TextKind {
+    fn max_len(self) -> usize {
+        match self {
+            TextKind::Addr => 48,
+            TextKind::Name => net::MAX_NAME_LEN,
+            TextKind::Code => net::CODE_LEN,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     Dec(Field),
     Inc(Field),
+    SetMode(Mode),
+    Edit(TextKind),
     Start,
     Replay,
     Menu,
@@ -158,6 +274,9 @@ struct MenuButton(MenuAction);
 
 #[derive(Component)]
 struct ValueText(Field);
+
+#[derive(Component)]
+struct FieldText(TextKind);
 
 const PLAYER_COLORS: [(f32, f32, f32); 8] = [
     (0.20, 0.55, 0.95), // blue
@@ -180,6 +299,8 @@ const BTN_HOVER: Color = Color::srgb(0.30, 0.33, 0.40);
 const BTN_PRESS: Color = Color::srgb(0.16, 0.45, 0.80);
 const START: Color = Color::srgb(0.18, 0.55, 0.30);
 const START_HOVER: Color = Color::srgb(0.24, 0.68, 0.38);
+const FIELD: Color = Color::srgb(0.12, 0.13, 0.16);
+const FIELD_FOCUS: Color = Color::srgb(0.18, 0.22, 0.30);
 
 fn player_color(i: usize) -> Color {
     let (r, g, b) = PLAYER_COLORS[i % PLAYER_COLORS.len()];
@@ -212,6 +333,16 @@ fn world_to_cell(w: Vec2) -> Pos {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let settings = match parse_args() {
+        Launch::Serve(addr) => {
+            if let Err(e) = server::run(&addr) {
+                eprintln!("server failed: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Launch::Client(settings) => settings,
+    };
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -223,15 +354,17 @@ fn main() {
             ..default()
         }))
         .insert_resource(ClearColor(BG))
-        .insert_resource(parse_args())
+        .insert_resource(settings)
         .init_resource::<Selected>()
+        .init_resource::<MenuStatus>()
+        .init_resource::<Focus>()
         .init_state::<AppState>()
         .add_systems(Startup, (spawn_camera, load_tank_assets))
         // Menu
         .add_systems(OnEnter(AppState::Menu), build_menu)
         .add_systems(
             Update,
-            (menu_keys, sync_menu_values)
+            (menu_autostart, menu_keys, menu_typing, sync_menu_values)
                 .chain()
                 .run_if(in_state(AppState::Menu)),
         )
@@ -243,11 +376,21 @@ fn main() {
             },
         )
         .add_systems(OnExit(AppState::Menu), despawn_all::<MenuEntity>)
+        // Waiting room (online)
+        .add_systems(OnEnter(AppState::Waiting), build_waiting)
+        .add_systems(
+            Update,
+            (waiting_keys, net_poll_waiting, sync_waiting_text)
+                .chain()
+                .run_if(in_state(AppState::Waiting)),
+        )
+        .add_systems(OnExit(AppState::Waiting), despawn_all::<WaitingEntity>)
         // Match
         .add_systems(OnEnter(AppState::Playing), build_board)
         .add_systems(
             Update,
             (
+                net_poll_playing,
                 handle_input,
                 sync_units,
                 sync_hover,
@@ -294,22 +437,30 @@ fn despawn_all<T: Component>(mut commands: Commands, q: Query<Entity, With<T>>) 
 // Menu
 // ---------------------------------------------------------------------------
 
+fn font(size: f32) -> TextFont {
+    TextFont {
+        font_size: size,
+        ..default()
+    }
+}
+
 fn build_menu(
     mut commands: Commands,
+    settings: Res<Settings>,
+    status: Res<MenuStatus>,
+    mut focus: ResMut<Focus>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Transform, With<Camera2d>>,
 ) {
+    // Back in the menu means any online session is over.
+    commands.remove_resource::<Net>();
+    focus.0 = None;
     if let Ok(mut w) = windows.single_mut() {
         w.resolution.set(MENU_W, MENU_H);
     }
     if let Ok(mut t) = cameras.single_mut() {
         t.translation = Vec3::ZERO;
     }
-
-    let font = |size: f32| TextFont {
-        font_size: size,
-        ..default()
-    };
 
     commands
         .spawn((
@@ -319,7 +470,7 @@ fn build_menu(
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Center,
                 justify_content: JustifyContent::Center,
-                row_gap: Val::Px(14.0),
+                row_gap: Val::Px(12.0),
                 ..default()
             },
             MenuEntity,
@@ -330,7 +481,7 @@ fn build_menu(
                 font(40.0),
                 TextColor(Color::srgb(0.95, 0.85, 0.30)),
                 Node {
-                    margin: UiRect::bottom(Val::Px(10.0)),
+                    margin: UiRect::bottom(Val::Px(6.0)),
                     ..default()
                 },
             ));
@@ -341,22 +492,7 @@ fn build_menu(
                 ("Board height", Field::Height),
                 ("Map seed", Field::Seed),
             ] {
-                root.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                })
-                .with_children(|row| {
-                    row.spawn((
-                        Text::new(label),
-                        font(22.0),
-                        TextColor(Color::srgb(0.9, 0.9, 0.9)),
-                        Node {
-                            width: Val::Px(170.0),
-                            ..default()
-                        },
-                    ));
+                menu_row(root, label, |row| {
                     spawn_button(row, "-", MenuAction::Dec(field), BTN, 44.0, &font(24.0));
                     row.spawn((
                         Text::new(""),
@@ -373,27 +509,108 @@ fn build_menu(
                 });
             }
 
+            menu_row(root, "Mode", |row| {
+                for (label, mode) in [
+                    ("Local", Mode::Local),
+                    ("Host", Mode::Host),
+                    ("Join", Mode::Join),
+                ] {
+                    let color = mode_color(mode, settings.mode);
+                    spawn_button(row, label, MenuAction::SetMode(mode), color, 100.0, &font(20.0));
+                }
+            });
+            for (label, kind) in [
+                ("Server", TextKind::Addr),
+                ("Your name", TextKind::Name),
+                ("Room code", TextKind::Code),
+            ] {
+                menu_row(root, label, |row| spawn_text_field(row, kind));
+            }
+
             root.spawn(Node {
-                margin: UiRect::top(Val::Px(16.0)),
+                margin: UiRect::top(Val::Px(10.0)),
                 ..default()
             })
             .with_children(|row| {
                 spawn_button(
                     row,
-                    "START  (Enter)",
+                    start_label(settings.mode),
                     MenuAction::Start,
                     START,
-                    240.0,
+                    260.0,
                     &font(26.0),
                 );
             });
 
             root.spawn((
-                Text::new("Keyboard: arrows change width/height, +/- players, S reroll seed"),
+                Text::new(status.0.clone()),
+                font(16.0),
+                TextColor(Color::srgb(0.95, 0.55, 0.45)),
+                StatusText,
+            ));
+            root.spawn((
+                Text::new(
+                    "Arrows: board size | +/-: players | S: reroll seed | click a text field to type\n\
+                     Online: one machine runs `beavy --serve 0.0.0.0:7777`; host opens a room, others join by code",
+                ),
                 font(14.0),
                 TextColor(Color::srgb(0.55, 0.55, 0.6)),
+                TextLayout::new_with_justify(JustifyText::Center),
             ));
         });
+}
+
+/// A labelled row of controls.
+fn menu_row(
+    root: &mut ChildSpawnerCommands,
+    label: &str,
+    controls: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    root.spawn(Node {
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(12.0),
+        ..default()
+    })
+    .with_children(|row| {
+        row.spawn((
+            Text::new(label),
+            font(22.0),
+            TextColor(Color::srgb(0.9, 0.9, 0.9)),
+            Node {
+                width: Val::Px(170.0),
+                ..default()
+            },
+        ));
+        controls(row);
+    });
+}
+
+/// A click-to-focus text box. Its content is filled by `sync_menu_values`.
+fn spawn_text_field(row: &mut ChildSpawnerCommands, kind: TextKind) {
+    row.spawn((
+        Button,
+        Node {
+            width: Val::Px(310.0),
+            height: Val::Px(40.0),
+            align_items: AlignItems::Center,
+            padding: UiRect::horizontal(Val::Px(10.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BorderColor(Color::srgb(0.45, 0.48, 0.55)),
+        BorderRadius::all(Val::Px(6.0)),
+        BackgroundColor(FIELD),
+        MenuButton(MenuAction::Edit(kind)),
+    ))
+    .with_children(|b| {
+        b.spawn((
+            Text::new(""),
+            font(20.0),
+            TextColor(Color::WHITE),
+            FieldText(kind),
+        ));
+    });
 }
 
 fn spawn_button(
@@ -425,6 +642,33 @@ fn spawn_button(
         });
 }
 
+fn start_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Local => "START  (Enter)",
+        Mode::Host => "HOST GAME  (Enter)",
+        Mode::Join => "JOIN GAME  (Enter)",
+    }
+}
+
+fn mode_color(button: Mode, active: Mode) -> Color {
+    if button == active {
+        BTN_PRESS
+    } else {
+        BTN
+    }
+}
+
+/// Resting colour of a button, given the current settings and focus.
+fn idle_color(action: MenuAction, settings: &Settings, focus: &Focus) -> Color {
+    match action {
+        MenuAction::Start | MenuAction::Replay => START,
+        MenuAction::SetMode(m) => mode_color(m, settings.mode),
+        MenuAction::Edit(k) if focus.0 == Some(k) => FIELD_FOCUS,
+        MenuAction::Edit(_) => FIELD,
+        _ => BTN,
+    }
+}
+
 /// Step a setting. `delta` is -1, 0 or +1; 0 on the seed means "reroll".
 fn adjust(settings: &mut Settings, field: Field, delta: i32) {
     const SEED_MOD: u64 = 100_000;
@@ -449,9 +693,58 @@ fn adjust(settings: &mut Settings, field: Field, delta: i32) {
     settings.clamp();
 }
 
+/// Start whatever the menu is set up for. Online modes connect first and go
+/// to the waiting room; a failed connection stays in the menu with a message.
+fn begin_match(
+    settings: &Settings,
+    commands: &mut Commands,
+    next: &mut NextState<AppState>,
+    status: &mut MenuStatus,
+) {
+    if settings.mode == Mode::Local {
+        next.set(AppState::Playing);
+        return;
+    }
+    if settings.mode == Mode::Join && settings.code.trim().is_empty() {
+        status.0 = "Enter the room code to join.".into();
+        return;
+    }
+    let client = match Client::connect(settings.addr.trim()) {
+        Ok(c) => c,
+        Err(e) => {
+            status.0 = format!("Could not connect to {}: {e}", settings.addr.trim());
+            return;
+        }
+    };
+    let name = settings.name.clone();
+    client.send(match settings.mode {
+        Mode::Host => ClientMsg::Create {
+            name,
+            settings: settings.match_settings(),
+        },
+        _ => ClientMsg::Join {
+            code: settings.code.trim().to_ascii_uppercase(),
+            name,
+        },
+    });
+    commands.insert_resource(Net {
+        client,
+        code: String::new(),
+        slot: None,
+        settings: settings.match_settings(),
+        roster: Vec::new(),
+        lost: None,
+    });
+    status.0.clear();
+    next.set(AppState::Waiting);
+}
+
 /// Shared handler for every UI button (menu and end screen).
 fn handle_buttons(
+    mut commands: Commands,
     mut settings: ResMut<Settings>,
+    mut focus: ResMut<Focus>,
+    mut status: ResMut<MenuStatus>,
     mut next: ResMut<NextState<AppState>>,
     mut q: Query<
         (&Interaction, &MenuButton, &mut BackgroundColor),
@@ -459,33 +752,72 @@ fn handle_buttons(
     >,
 ) {
     for (interaction, button, mut bg) in &mut q {
-        let is_start = matches!(button.0, MenuAction::Start | MenuAction::Replay);
         match *interaction {
             Interaction::Pressed => {
                 *bg = BackgroundColor(BTN_PRESS);
+                // Clicking anything but a text field drops keyboard focus.
+                if !matches!(button.0, MenuAction::Edit(_)) && focus.0.is_some() {
+                    focus.0 = None;
+                }
                 match button.0 {
                     MenuAction::Dec(f) => adjust(&mut settings, f, -1),
                     MenuAction::Inc(f) => adjust(&mut settings, f, 1),
-                    MenuAction::Start => next.set(AppState::Playing),
+                    MenuAction::SetMode(m) => settings.mode = m,
+                    MenuAction::Edit(k) => focus.0 = Some(k),
+                    MenuAction::Start => {
+                        begin_match(&settings, &mut commands, &mut next, &mut status);
+                    }
                     MenuAction::Replay => next.set(AppState::Restart),
                     MenuAction::Menu => next.set(AppState::Menu),
                 }
             }
             Interaction::Hovered => {
-                *bg = BackgroundColor(if is_start { START_HOVER } else { BTN_HOVER });
+                *bg = BackgroundColor(match button.0 {
+                    MenuAction::Start | MenuAction::Replay => START_HOVER,
+                    MenuAction::Edit(_) => FIELD_FOCUS,
+                    _ => BTN_HOVER,
+                });
             }
-            Interaction::None => *bg = BackgroundColor(if is_start { START } else { BTN }),
+            Interaction::None => *bg = BackgroundColor(idle_color(button.0, &settings, &focus)),
         }
     }
 }
 
+/// Honour `--host` / `--join` once, on the first menu frame.
+fn menu_autostart(
+    mut commands: Commands,
+    mut settings: ResMut<Settings>,
+    mut status: ResMut<MenuStatus>,
+    mut next: ResMut<NextState<AppState>>,
+) {
+    if settings.autostart {
+        settings.autostart = false;
+        begin_match(&settings, &mut commands, &mut next, &mut status);
+    }
+}
+
 fn menu_keys(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mut settings: ResMut<Settings>,
+    mut focus: ResMut<Focus>,
+    mut status: ResMut<MenuStatus>,
     mut next: ResMut<NextState<AppState>>,
 ) {
     if keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]) {
-        next.set(AppState::Playing);
+        if focus.0.is_some() {
+            focus.0 = None;
+        } else {
+            begin_match(&settings, &mut commands, &mut next, &mut status);
+        }
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) && focus.0.is_some() {
+        focus.0 = None;
+        return;
+    }
+    if focus.0.is_some() {
+        // Typing goes to the field; see `menu_typing`.
         return;
     }
     let mut change: Option<(Field, i32)> = None;
@@ -509,11 +841,74 @@ fn menu_keys(
     }
 }
 
-fn sync_menu_values(settings: Res<Settings>, mut q: Query<(&ValueText, &mut Text)>) {
-    if !settings.is_changed() {
+/// Append typed characters to the focused text field.
+fn menu_typing(
+    mut events: EventReader<KeyboardInput>,
+    focus: Res<Focus>,
+    mut settings: ResMut<Settings>,
+) {
+    let Some(kind) = focus.0 else {
+        events.clear();
+        return;
+    };
+    for ev in events.read() {
+        if !ev.state.is_pressed() {
+            continue;
+        }
+        let max = kind.max_len();
+        let field = match kind {
+            TextKind::Addr => &mut settings.addr,
+            TextKind::Name => &mut settings.name,
+            TextKind::Code => &mut settings.code,
+        };
+        match &ev.logical_key {
+            Key::Backspace => {
+                field.pop();
+            }
+            Key::Space if kind == TextKind::Name => push_capped(field, " ", max),
+            Key::Character(text) => {
+                let text = if kind == TextKind::Code {
+                    text.to_ascii_uppercase()
+                } else {
+                    text.to_string()
+                };
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                push_capped(field, &clean, max);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_capped(field: &mut String, text: &str, max: usize) {
+    for c in text.chars() {
+        if field.chars().count() >= max {
+            break;
+        }
+        field.push(c);
+    }
+}
+
+fn sync_menu_values(
+    settings: Res<Settings>,
+    focus: Res<Focus>,
+    status: Res<MenuStatus>,
+    mut values: Query<(&ValueText, &mut Text), (Without<FieldText>, Without<StatusText>)>,
+    mut fields: Query<(&FieldText, &mut Text), (Without<ValueText>, Without<StatusText>)>,
+    mut starts: Query<(&MenuButton, &Children)>,
+    mut labels: Query<&mut Text, (Without<ValueText>, Without<FieldText>, Without<StatusText>)>,
+    mut status_text: Query<&mut Text, With<StatusText>>,
+    mut buttons: Query<(&MenuButton, &Interaction, &mut BackgroundColor)>,
+) {
+    if status.is_changed() {
+        if let Ok(mut t) = status_text.single_mut() {
+            t.0.clone_from(&status.0);
+        }
+    }
+    if !(settings.is_changed() || focus.is_changed()) {
         return;
     }
-    for (field, mut text) in &mut q {
+    for (field, mut text) in &mut values {
         text.0 = match field.0 {
             Field::Players => settings.players.to_string(),
             Field::Width => settings.width.to_string(),
@@ -521,6 +916,149 @@ fn sync_menu_values(settings: Res<Settings>, mut q: Query<(&ValueText, &mut Text
             Field::Seed => settings.seed.to_string(),
         };
     }
+    for (field, mut text) in &mut fields {
+        let value = match field.0 {
+            TextKind::Addr => &settings.addr,
+            TextKind::Name => &settings.name,
+            TextKind::Code => &settings.code,
+        };
+        let cursor = if focus.0 == Some(field.0) { "_" } else { "" };
+        text.0 = format!("{value}{cursor}");
+    }
+    for (button, children) in &mut starts {
+        if button.0 == MenuAction::Start {
+            for child in children {
+                if let Ok(mut t) = labels.get_mut(*child) {
+                    t.0 = start_label(settings.mode).to_string();
+                }
+            }
+        }
+    }
+    for (button, interaction, mut bg) in &mut buttons {
+        if *interaction == Interaction::None {
+            *bg = BackgroundColor(idle_color(button.0, &settings, &focus));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Waiting room (online)
+// ---------------------------------------------------------------------------
+
+fn build_waiting(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(14.0),
+                ..default()
+            },
+            WaitingEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Text::new("Connecting..."),
+                font(26.0),
+                TextColor(Color::WHITE),
+                TextLayout::new_with_justify(JustifyText::Center),
+                WaitingText,
+            ));
+            root.spawn((
+                Text::new("Esc: back to menu"),
+                font(14.0),
+                TextColor(Color::srgb(0.55, 0.55, 0.6)),
+            ));
+        });
+}
+
+fn waiting_keys(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppState>>) {
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(AppState::Menu);
+    }
+}
+
+/// Handle server messages until the room is full, then start the match.
+fn net_poll_waiting(
+    net: Option<ResMut<Net>>,
+    mut status: ResMut<MenuStatus>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    let Some(mut net) = net else {
+        next_state.set(AppState::Menu);
+        return;
+    };
+    while let Some(event) = net.client.poll() {
+        match event {
+            Event::Msg(ServerMsg::Joined {
+                code,
+                slot,
+                settings,
+            }) => {
+                net.code = code;
+                net.slot = Some(slot);
+                net.settings = settings;
+            }
+            Event::Msg(ServerMsg::Roster { names }) => net.roster = names,
+            Event::Msg(ServerMsg::Started) => {
+                next_state.set(AppState::Playing);
+                return;
+            }
+            Event::Msg(ServerMsg::Rejected(why)) => {
+                status.0 = format!("Server refused: {why}");
+                next_state.set(AppState::Menu);
+                return;
+            }
+            Event::Msg(_) => {}
+            Event::Disconnected(why) => {
+                status.0 = format!("Connection lost: {why}");
+                next_state.set(AppState::Menu);
+                return;
+            }
+        }
+    }
+}
+
+fn sync_waiting_text(net: Option<Res<Net>>, mut q: Query<&mut Text, With<WaitingText>>) {
+    let Some(net) = net else { return };
+    if !net.is_changed() {
+        return;
+    }
+    let Ok(mut text) = q.single_mut() else {
+        return;
+    };
+    let mut s = String::new();
+    if net.code.is_empty() {
+        s.push_str("Connecting...");
+    } else {
+        let taken = net.roster.iter().flatten().count();
+        let _ = writeln!(s, "Room code: {}", net.code);
+        let _ = writeln!(
+            s,
+            "{}x{} board, seed {}",
+            net.settings.width, net.settings.height, net.settings.seed
+        );
+        let _ = writeln!(
+            s,
+            "\nWaiting for players ({taken}/{})...\n",
+            net.settings.players
+        );
+        for (i, seat) in net.roster.iter().enumerate() {
+            let you = if net.slot == Some(i) { " (you)" } else { "" };
+            match seat {
+                Some(name) => {
+                    let _ = writeln!(s, "{}: {name}{you}", color_name(i));
+                }
+                None => {
+                    let _ = writeln!(s, "{}: open", color_name(i));
+                }
+            }
+        }
+    }
+    text.0 = s;
 }
 
 // ---------------------------------------------------------------------------
@@ -530,17 +1068,24 @@ fn sync_menu_values(settings: Res<Settings>, mut q: Query<(&ValueText, &mut Text
 fn build_board(
     mut commands: Commands,
     settings: Res<Settings>,
+    net: Option<Res<Net>>,
     mut selected: ResMut<Selected>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Transform, With<Camera2d>>,
 ) {
-    let game = Game::new(
-        settings.width,
-        settings.height,
-        settings.players,
-        settings.seed,
-    );
-    selected.0 = first_own_unit(&game);
+    // Online, the server dictates the board; every client builds the same one.
+    let ms = net
+        .as_ref()
+        .map_or_else(|| settings.match_settings(), |n| n.settings);
+    let mut game = Game::new(ms.width, ms.height, ms.players, ms.seed);
+    if let Some(net) = &net {
+        for (p, seat) in game.players.iter_mut().zip(&net.roster) {
+            if let Some(name) = seat {
+                p.name.clone_from(name);
+            }
+        }
+    }
+    selected.0 = first_unit_of(&game, acting_player(&game, net.as_deref()));
 
     let grid_w = grid_f32(game.width) * CELL;
     let grid_h = grid_f32(game.height) * CELL;
@@ -669,17 +1214,23 @@ fn cursor_cell(
     Some(world_to_cell(world))
 }
 
-/// First tank of the player to act, used as the default selection.
-fn first_own_unit(g: &Game) -> Option<u32> {
-    g.units.iter().find(|u| u.owner == g.current).map(|u| u.id)
+/// Whose tanks this window controls: the player to act when hot-seat, our
+/// seat when online.
+fn acting_player(g: &Game, net: Option<&Net>) -> usize {
+    net.and_then(|n| n.slot).unwrap_or(g.current)
 }
 
-/// Next own tank after `current` in unit order, wrapping around.
-fn next_own_unit(g: &Game, current: Option<u32>) -> Option<u32> {
+/// First tank of `owner`, used as the default selection.
+fn first_unit_of(g: &Game, owner: usize) -> Option<u32> {
+    g.units.iter().find(|u| u.owner == owner).map(|u| u.id)
+}
+
+/// Next tank of `owner` after `current` in unit order, wrapping around.
+fn next_unit_of(g: &Game, owner: usize, current: Option<u32>) -> Option<u32> {
     let own: Vec<u32> = g
         .units
         .iter()
-        .filter(|u| u.owner == g.current)
+        .filter(|u| u.owner == owner)
         .map(|u| u.id)
         .collect();
     let idx = current
@@ -690,31 +1241,37 @@ fn next_own_unit(g: &Game, current: Option<u32>) -> Option<u32> {
 
 fn handle_input(
     mut game: ResMut<GameRes>,
+    net: Option<Res<Net>>,
     mut selected: ResMut<Selected>,
-    mut next: ResMut<NextState<AppState>>,
+    mut next_state: ResMut<NextState<AppState>>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform)>,
 ) {
     if keys.just_pressed(KeyCode::KeyM) {
-        next.set(AppState::Menu);
+        next_state.set(AppState::Menu);
         return;
     }
+    let online = net.is_some();
     if game.0.result.is_some() {
-        if keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]) {
-            next.set(AppState::Restart);
+        if !online && keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]) {
+            next_state.set(AppState::Restart);
         }
         return;
     }
+    if net.as_ref().is_some_and(|n| n.lost.is_some()) {
+        return;
+    }
+    let me = acting_player(&game.0, net.as_deref());
 
-    // Mouse: select one of the current player's tanks, or deselect.
+    // Mouse: select one of our tanks, or deselect.
     if mouse.just_pressed(MouseButton::Left) {
         let g: &Game = &game.0;
         let picked = cursor_cell(&windows, &cameras)
             .filter(|&p| g.in_bounds(p))
             .and_then(|p| g.unit_at(p))
-            .filter(|u| u.owner == g.current)
+            .filter(|u| u.owner == me)
             .map(|u| u.id);
         if selected.0 != picked {
             selected.0 = picked;
@@ -725,7 +1282,7 @@ fn handle_input(
         selected.0 = None;
     }
     if keys.just_pressed(KeyCode::Tab) {
-        selected.0 = next_own_unit(&game.0, selected.0);
+        selected.0 = next_unit_of(&game.0, me, selected.0);
     }
 
     // Keyboard: pick exactly one action.
@@ -768,12 +1325,67 @@ fn handle_input(
     };
 
     let Some(action) = action else { return };
+    if let Some(net) = net {
+        // Online: the server decides. The move comes back as `Applied`.
+        if game.0.current == me {
+            net.client.send(ClientMsg::Act(action));
+        } else {
+            game.0.log.push("Wait for your turn.".into());
+        }
+        return;
+    }
     match game.0.apply(action) {
         Ok(_) => {
-            // Turn passed to the next player; preselect one of their tanks.
-            selected.0 = first_own_unit(&game.0);
+            // Turn passed to the next_state player; preselect one of their tanks.
+            selected.0 = first_unit_of(&game.0, game.0.current);
         }
         Err(e) => game.0.log.push(format!("Not allowed: {e}.")),
+    }
+}
+
+/// Online: apply what the server broadcasts.
+fn net_poll_playing(
+    net: Option<ResMut<Net>>,
+    mut game: ResMut<GameRes>,
+    mut selected: ResMut<Selected>,
+) {
+    let Some(mut net) = net else { return };
+    while let Some(event) = net.client.poll() {
+        match event {
+            Event::Msg(ServerMsg::Applied { slot, action }) => {
+                if game.0.current != slot {
+                    game.0
+                        .log
+                        .push("Out of sync with the server; return to the menu (M).".into());
+                    net.lost = Some("desync".into());
+                    return;
+                }
+                if let Err(e) = game.0.apply(action) {
+                    game.0.log.push(format!("Server move failed locally: {e}."));
+                }
+            }
+            Event::Msg(ServerMsg::Resigned { slot }) => game.0.resign(slot),
+            Event::Msg(ServerMsg::Rejected(why)) => {
+                game.0.log.push(format!("Not allowed: {why}."));
+            }
+            Event::Msg(ServerMsg::Roster { names }) => net.roster = names,
+            Event::Msg(_) => {}
+            Event::Disconnected(why) => {
+                game.0
+                    .log
+                    .push(format!("Connection lost: {why}. Press M for the menu."));
+                net.lost = Some(why);
+                return;
+            }
+        }
+    }
+    // Keep a valid selection: our first tank if the old one is gone.
+    let me = acting_player(&game.0, Some(&net));
+    if selected.0.and_then(|id| game.0.unit(id)).is_none() {
+        let fresh = first_unit_of(&game.0, me);
+        if selected.0 != fresh {
+            selected.0 = fresh;
+        }
     }
 }
 
@@ -968,6 +1580,7 @@ fn end_summary(g: &Game, result: GameOver) -> (String, Color, Vec<String>) {
 fn show_end_screen(
     mut commands: Commands,
     game: Res<GameRes>,
+    net: Option<Res<Net>>,
     mut selected: ResMut<Selected>,
     existing: Query<(), With<EndScreen>>,
 ) {
@@ -1033,20 +1646,28 @@ fn show_end_screen(
                 ..default()
             })
             .with_children(|row| {
-                spawn_button(
-                    row,
-                    "Play again (Enter)",
-                    MenuAction::Replay,
-                    START,
-                    230.0,
-                    &font(20.0),
-                );
+                // Online rematches would need a new room; go via the menu.
+                if net.is_none() {
+                    spawn_button(
+                        row,
+                        "Play again (Enter)",
+                        MenuAction::Replay,
+                        START,
+                        230.0,
+                        &font(20.0),
+                    );
+                }
                 spawn_button(row, "Menu (M)", MenuAction::Menu, BTN, 160.0, &font(20.0));
             });
         });
 }
 
-fn sync_hud(game: Res<GameRes>, selected: Res<Selected>, mut hud: Query<&mut Text, With<HudText>>) {
+fn sync_hud(
+    game: Res<GameRes>,
+    net: Option<Res<Net>>,
+    selected: Res<Selected>,
+    mut hud: Query<&mut Text, With<HudText>>,
+) {
     if !(game.is_changed() || selected.is_changed()) {
         return;
     }
@@ -1060,13 +1681,21 @@ fn sync_hud(game: Res<GameRes>, selected: Res<Selected>, mut hud: Query<&mut Tex
         let _ = writeln!(s, "GAME OVER after {} turns", g.turn);
     } else {
         let cur = g.current_player();
-        let _ = writeln!(
+        let _ = write!(
             s,
             "Turn {}  |  {} ({}) to act",
             g.turn,
             cur.name,
-            PLAYER_COLOR_NAMES[g.current % PLAYER_COLOR_NAMES.len()]
+            color_name(g.current)
         );
+        if let Some(net) = &net {
+            let me = acting_player(g, Some(net));
+            let _ = write!(s, "  |  Room {}  |  You: {}", net.code, color_name(me));
+            if g.current != me {
+                s.push_str("  |  waiting for them...");
+            }
+        }
+        s.push('\n');
     }
 
     let roster: Vec<String> = g
