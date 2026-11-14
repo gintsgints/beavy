@@ -1,0 +1,24 @@
+[package]
+name = "beavy"
+version = "0.1.0"
+edition = "2021"
+description = "Hot-seat turn-based 2D tank strategy game built on Bevy"
+
+[dependencies]
+bevy = "0.16"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Bevy systems take Res/Query by value and often need many parameters.
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+module_name_repetitions = "allow"
+
+# Faster iteration: optimize dependencies, keep our own crate quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
