@@ -1927,7 +1927,7 @@ fn sync_hud(
         s.push_str("Selected: none (click one of your units or press Tab)\n");
     }
 
-    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise | F found base | Space end turn | M menu\n");
+    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise (at own base) | F found base | Space end turn | M menu\n");
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }

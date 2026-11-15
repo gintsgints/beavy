@@ -149,6 +149,7 @@ pub enum ActionError {
     TooCloseToBase,
     UnitAlreadyActed,
     BaseAlreadyActed,
+    NotNearOwnBase,
 }
 
 impl std::fmt::Display for ActionError {
@@ -169,6 +170,7 @@ impl std::fmt::Display for ActionError {
             ActionError::TooCloseToBase => "too close to a base: keep two free tiles between bases",
             ActionError::UnitAlreadyActed => "that unit has already acted this turn",
             ActionError::BaseAlreadyActed => "that base has already produced this turn",
+            ActionError::NotNearOwnBase => "tanks can only be raised on or next to a base you hold",
         };
         f.write_str(s)
     }
@@ -505,9 +507,15 @@ impl Game {
         Ok(Outcome::Produced { unit, kind })
     }
 
+    /// +1 strength for a tank on or orthogonally next to a base `me` holds.
     fn raise(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
-        if self.own_unit(me, id)?.kind == UnitKind::Settler {
+        let u = self.own_unit(me, id)?;
+        if u.kind == UnitKind::Settler {
             return Err(ActionError::CannotRaiseSettler);
+        }
+        let pos = u.pos;
+        if !self.held_bases(me).any(|b| b.manhattan(pos) <= 1) {
+            return Err(ActionError::NotNearOwnBase);
         }
         let u = self.unit_mut(id);
         u.strength += 1;
@@ -1052,7 +1060,7 @@ mod tests {
     #[test]
     fn raise_adds_one_strength() {
         let mut g = arena();
-        let a = g.spawn_unit(0, Pos::new(2, 2), 1);
+        let a = g.spawn_unit(0, Pos::new(1, 0), 1);
         let out = g.apply(Action::Raise { unit: a }).unwrap();
         assert_eq!(
             out,
@@ -1062,6 +1070,25 @@ mod tests {
             }
         );
         assert_eq!(g.unit(a).unwrap().strength, 2);
+    }
+
+    #[test]
+    fn raise_only_on_or_next_to_held_base() {
+        let mut g = arena();
+        g.bases[1].holder = None;
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        let on = g.spawn_unit(0, Pos::new(0, 0), 1);
+        let diagonal = g.spawn_unit(0, Pos::new(1, 1), 1);
+        let far = g.spawn_unit(0, Pos::new(2, 0), 1);
+        let neutral = g.spawn_unit(0, Pos::new(4, 5), 1);
+        g.apply(Action::Raise { unit: on }).unwrap();
+        for unit in [diagonal, far, neutral] {
+            assert_eq!(
+                g.apply(Action::Raise { unit }),
+                Err(ActionError::NotNearOwnBase)
+            );
+        }
+        assert_eq!(g.unit(far).unwrap().strength, 1);
     }
 
     #[test]
@@ -1357,7 +1384,7 @@ mod tests {
     fn each_unit_acts_once_per_turn() {
         let mut g = arena();
         let a = g.spawn_unit(0, Pos::new(2, 2), 1);
-        let b = g.spawn_unit(0, Pos::new(3, 3), 1);
+        let b = g.spawn_unit(0, Pos::new(0, 1), 1);
         g.spawn_unit(1, Pos::new(5, 0), 1);
         let right = Action::Move {
             unit: a,

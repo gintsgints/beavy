@@ -44,7 +44,8 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
     base to produce there; otherwise your home base is tried first, then the others.
   - **Found** a base with the selected settler (F): the settler becomes a base on its tile.
     Every base needs two free tiles to every other base, diagonals included.
-  - **Raise** a selected tank's strength by 1 (R). Settlers cannot be raised.
+  - **Raise** a selected tank's strength by 1 (R) while it stands on or next to (not diagonally)
+    a base you hold. Settlers cannot be raised.
   - Space ends your turn. Spent units are dimmed; new units and bases you just captured or founded
     wait for your next turn. `M` returns to the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
