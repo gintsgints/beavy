@@ -50,9 +50,9 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
 - A tank ending a move on a base you do not hold captures it; its frame takes your colour. You produce
   at every base you hold (your home base first). A player whose home base is taken stays in
   the game and can retake it the same way.
-- A player with no units left (tanks or settlers) is eliminated, even if they still hold bases.
-  Founding a base with your last unit therefore knocks you out. Bases they
-  held turn grey (neutral) and can be captured by anyone.
+- A player is eliminated only when they have no units (tanks or settlers) and hold no base.
+  With a base left they stay in and can produce again; losing that base while unitless ends them.
+- A player who disconnects resigns; bases they held turn grey (neutral) and anyone can capture them.
 - Last player alive wins. If the last players knock each other out at once, the game is a draw.
 - The end screen offers Play again (same settings, Enter) or Menu (M).
 

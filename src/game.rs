@@ -605,15 +605,15 @@ impl Game {
         }
     }
 
-    /// A player with no tanks left is out, even if they still hold bases. Then: one player left wins, nobody
-    /// left is a tie.
+    /// A player with no units and no base to produce at is out. Then: one
+    /// player left wins, nobody left is a tie.
     fn check_victory(&mut self) {
         for i in 0..self.players.len() {
-            if self.players[i].alive && !self.units.iter().any(|u| u.owner == i) {
+            let has_units = self.units.iter().any(|u| u.owner == i);
+            if self.players[i].alive && !has_units && self.held_bases(i).next().is_none() {
                 self.players[i].alive = false;
-                self.release_bases(i);
                 self.log.push(format!(
-                    "{} has no units left and is out.",
+                    "{} has no units and no bases left and is out.",
                     self.players[i].name
                 ));
             }
@@ -861,6 +861,7 @@ mod tests {
     #[test]
     fn equal_strength_destroys_both() {
         let mut g = arena();
+        no_bases(&mut g);
         let a = g.spawn_unit(0, Pos::new(2, 2), 4);
         g.spawn_unit(1, Pos::new(1, 2), 4);
         let out = g
@@ -871,13 +872,14 @@ mod tests {
             .unwrap();
         assert_eq!(out, Outcome::BothDestroyed);
         assert!(g.units.is_empty());
-        assert_eq!(g.result, Some(GameOver::Tie), "last tanks of both players");
+        assert_eq!(g.result, Some(GameOver::Tie), "last units, no bases");
         assert!(g.players.iter().all(|p| !p.alive));
     }
 
     #[test]
-    fn losing_last_tank_eliminates_player_and_other_wins() {
+    fn losing_last_unit_without_base_eliminates_player() {
         let mut g = arena();
+        no_bases(&mut g);
         let a = g.spawn_unit(0, Pos::new(2, 2), 1);
         g.spawn_unit(1, Pos::new(2, 3), 5);
         g.apply(Action::Move {
@@ -894,6 +896,7 @@ mod tests {
         let mut g = Game::new(8, 8, 3, 3);
         g.terrain = vec![Terrain::Plain; 64];
         g.units.clear();
+        no_bases(&mut g);
         let a = g.spawn_unit(0, Pos::new(1, 1), 2);
         g.spawn_unit(1, Pos::new(2, 1), 2);
         g.spawn_unit(2, Pos::new(6, 6), 1);
@@ -1072,29 +1075,58 @@ mod tests {
     }
 
     #[test]
-    fn bases_of_eliminated_holder_become_neutral() {
+    fn resigning_frees_held_bases() {
         let mut g = Game::new(8, 8, 3, 3);
-        g.terrain = vec![Terrain::Plain; 64];
-        g.units.clear();
-        for (i, base) in [Pos::new(0, 0), Pos::new(7, 0), Pos::new(7, 7)]
-            .into_iter()
-            .enumerate()
-        {
-            g.bases[i].pos = base;
-        }
         g.bases[2].holder = Some(1);
-        let a = g.spawn_unit(0, Pos::new(1, 1), 2);
-        g.spawn_unit(1, Pos::new(2, 1), 1);
-        g.spawn_unit(2, Pos::new(6, 6), 1);
+        g.resign(1);
+        assert_eq!(g.bases[1].holder, None);
+        assert_eq!(g.bases[2].holder, None);
+        assert_eq!(g.bases[0].holder, Some(0));
+    }
+
+    #[test]
+    fn player_without_units_but_with_base_stays_in_and_produces() {
+        let mut g = arena();
+        let a = g.spawn_unit(0, Pos::new(2, 2), 3);
+        g.spawn_unit(1, Pos::new(3, 2), 1);
+        g.apply(Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        assert!(g.players[1].alive, "still holds home base");
+        assert!(g.result.is_none());
+        assert_eq!(g.current, 1);
+        let Outcome::Produced { unit, .. } = g
+            .apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: None,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(5, 5));
+    }
+
+    #[test]
+    fn capturing_last_base_of_unitless_player_ends_game() {
+        let mut g = arena();
+        let a = g.spawn_unit(0, Pos::new(4, 5), 2);
         g.apply(Action::Move {
             unit: a,
             dir: Dir::Right,
         })
         .unwrap();
         assert!(!g.players[1].alive);
-        assert_eq!(g.bases[1].holder, None);
-        assert_eq!(g.bases[2].holder, None);
-        assert_eq!(g.bases[0].holder, Some(0));
+        assert_eq!(g.result, Some(GameOver::Winner(0)));
+    }
+
+    /// Make every base neutral so losing units is what decides elimination.
+    fn no_bases(g: &mut Game) {
+        for b in &mut g.bases {
+            b.holder = None;
+        }
     }
 
     fn settler(g: &mut Game, owner: usize, pos: Pos) -> u32 {
@@ -1155,7 +1187,6 @@ mod tests {
     fn settler_founds_base_and_is_consumed() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1);
-        g.spawn_unit(0, Pos::new(0, 0), 1); // founding must not leave player 1 unitless
         let s = settler(&mut g, 0, Pos::new(3, 0));
         assert_eq!(
             g.apply(Action::Found { unit: s }),
