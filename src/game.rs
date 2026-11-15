@@ -62,7 +62,12 @@ pub struct Unit {
 #[derive(Clone, Debug)]
 pub struct Player {
     pub name: String,
+    /// Home base position; fixed for the whole match.
     pub base: Pos,
+    /// Who holds this base now and may produce there. Starts as the owner;
+    /// changes when another player's tank ends a move on it; `None` once the
+    /// holder is out.
+    pub base_holder: Option<usize>,
     pub alive: bool,
 }
 
@@ -84,6 +89,7 @@ pub enum ActionError {
     OffMap,
     Water,
     OwnUnitThere,
+    NoBase,
     NoRoomAtBase,
 }
 
@@ -96,7 +102,8 @@ impl std::fmt::Display for ActionError {
             ActionError::OffMap => "cannot move off the map",
             ActionError::Water => "cannot drive into water",
             ActionError::OwnUnitThere => "one of your tanks is already there",
-            ActionError::NoRoomAtBase => "no free cell at your base",
+            ActionError::NoBase => "you hold no base to produce at",
+            ActionError::NoRoomAtBase => "no free cell at your bases",
         };
         f.write_str(s)
     }
@@ -212,6 +219,7 @@ impl Game {
             .map(|(i, &base)| Player {
                 name: format!("Player {}", i + 1),
                 base,
+                base_holder: Some(i),
                 alive: true,
             })
             .collect::<Vec<_>>();
@@ -256,6 +264,22 @@ impl Game {
 
     pub fn base_owner(&self, p: Pos) -> Option<usize> {
         self.players.iter().position(|pl| pl.base == p)
+    }
+
+    /// Positions of every base `player` currently holds, home base first.
+    pub fn held_bases(&self, player: usize) -> impl Iterator<Item = Pos> + '_ {
+        let home = self
+            .players
+            .get(player)
+            .filter(|p| p.base_holder == Some(player))
+            .map(|p| p.base);
+        let others = self
+            .players
+            .iter()
+            .enumerate()
+            .filter(move |&(i, p)| i != player && p.base_holder == Some(player))
+            .map(|(_, p)| p.base);
+        home.into_iter().chain(others)
     }
 
     pub fn alive_players(&self) -> impl Iterator<Item = usize> + '_ {
@@ -323,10 +347,16 @@ impl Game {
         id
     }
 
+    /// New tank at the first held base (home first) that has a free cell on
+    /// or next to it.
     fn produce(&mut self, me: usize) -> Result<Outcome, ActionError> {
-        let base = self.players[me].base;
-        let spot = std::iter::once(base)
-            .chain(DIRS.iter().map(|&d| base.step(d)))
+        let bases: Vec<Pos> = self.held_bases(me).collect();
+        if bases.is_empty() {
+            return Err(ActionError::NoBase);
+        }
+        let spot = bases
+            .iter()
+            .flat_map(|&base| std::iter::once(base).chain(DIRS.iter().map(move |&d| base.step(d))))
             .find(|&p| {
                 self.in_bounds(p)
                     && self.terrain_at(p) == Terrain::Plain
@@ -393,11 +423,11 @@ impl Game {
             },
         };
 
-        // Standing on an enemy base captures it and eliminates its owner.
+        // Ending a move on a base we do not hold takes it over.
         if self.unit(id).is_some() {
-            if let Some(victim) = self.base_owner(to) {
-                if victim != me && self.players[victim].alive {
-                    self.eliminate(victim, me);
+            if let Some(home_of) = self.base_owner(to) {
+                if self.players[home_of].base_holder != Some(me) {
+                    self.capture(home_of, me);
                 }
             }
         }
@@ -413,6 +443,7 @@ impl Game {
         }
         self.players[player].alive = false;
         self.units.retain(|u| u.owner != player);
+        self.release_bases(player);
         self.log
             .push(format!("{} left the game.", self.players[player].name));
         self.check_victory();
@@ -421,21 +452,35 @@ impl Game {
         }
     }
 
-    fn eliminate(&mut self, victim: usize, by: usize) {
-        self.players[victim].alive = false;
-        self.units.retain(|u| u.owner != victim);
-        self.log.push(format!(
-            "{} captured {}'s base! {} is out.",
-            self.players[by].name, self.players[victim].name, self.players[victim].name
-        ));
+    fn capture(&mut self, home_of: usize, by: usize) {
+        self.players[home_of].base_holder = Some(by);
+        let msg = if home_of == by {
+            format!("{} took back their base!", self.players[by].name)
+        } else {
+            format!(
+                "{} captured {}'s base!",
+                self.players[by].name, self.players[home_of].name
+            )
+        };
+        self.log.push(msg);
     }
 
-    /// A player with no tanks left is out. Then: one player left wins, nobody
+    /// Bases held by a player who is out become neutral.
+    fn release_bases(&mut self, player: usize) {
+        for p in &mut self.players {
+            if p.base_holder == Some(player) {
+                p.base_holder = None;
+            }
+        }
+    }
+
+    /// A player with no tanks left is out, even if they still hold bases. Then: one player left wins, nobody
     /// left is a tie.
     fn check_victory(&mut self) {
         for i in 0..self.players.len() {
             if self.players[i].alive && !self.units.iter().any(|u| u.owner == i) {
                 self.players[i].alive = false;
+                self.release_bases(i);
                 self.log.push(format!(
                     "{} has no tanks left and is out.",
                     self.players[i].name
@@ -820,22 +865,78 @@ mod tests {
     }
 
     #[test]
-    fn capturing_base_eliminates_owner_and_ends_game() {
+    fn capturing_base_takes_production_but_owner_stays_in() {
         let mut g = arena();
         let a = g.spawn_unit(0, Pos::new(4, 5), 3);
-        g.spawn_unit(1, Pos::new(0, 5), 9); // enemy army elsewhere
+        let far = g.spawn_unit(1, Pos::new(0, 5), 9); // enemy army elsewhere
+        g.apply(Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        assert_eq!(g.players[1].base_holder, Some(0));
+        assert!(g.players[1].alive, "still has a tank");
+        assert!(g.unit(far).is_some());
+        assert!(g.result.is_none());
+        assert_eq!(g.apply(Action::Produce), Err(ActionError::NoBase));
+        assert_eq!(g.current, 1, "failed produce keeps the turn");
+    }
+
+    #[test]
+    fn captor_produces_at_home_first_then_captured_base() {
+        let mut g = arena();
+        g.players[1].base_holder = Some(0);
+        g.spawn_unit(1, Pos::new(3, 3), 1); // keeps player 2 in the game
+                                            // Fill player 1's home and its neighbours.
+        for p in [Pos::new(0, 0), Pos::new(1, 0), Pos::new(0, 1)] {
+            g.spawn_unit(0, p, 1);
+        }
+        let Outcome::Produced { unit } = g.apply(Action::Produce).unwrap() else {
+            panic!()
+        };
+        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(5, 5));
+    }
+
+    #[test]
+    fn owner_can_retake_base() {
+        let mut g = arena();
+        g.players[1].base_holder = Some(0);
+        g.spawn_unit(0, Pos::new(0, 0), 1);
+        let b = g.spawn_unit(1, Pos::new(5, 4), 1);
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Move {
+            unit: b,
+            dir: Dir::Up,
+        })
+        .unwrap();
+        assert_eq!(g.players[1].base_holder, Some(1));
+        assert!(g.log.iter().any(|l| l.contains("took back")));
+    }
+
+    #[test]
+    fn bases_of_eliminated_holder_become_neutral() {
+        let mut g = Game::new(8, 8, 3, 3);
+        g.terrain = vec![Terrain::Plain; 64];
+        g.units.clear();
+        for (i, base) in [Pos::new(0, 0), Pos::new(7, 0), Pos::new(7, 7)]
+            .into_iter()
+            .enumerate()
+        {
+            g.players[i].base = base;
+        }
+        g.players[2].base_holder = Some(1);
+        let a = g.spawn_unit(0, Pos::new(1, 1), 2);
+        g.spawn_unit(1, Pos::new(2, 1), 1);
+        g.spawn_unit(2, Pos::new(6, 6), 1);
         g.apply(Action::Move {
             unit: a,
             dir: Dir::Right,
         })
         .unwrap();
         assert!(!g.players[1].alive);
-        assert!(
-            g.units.iter().all(|u| u.owner == 0),
-            "victim's units removed"
-        );
-        assert_eq!(g.result, Some(GameOver::Winner(0)));
-        assert_eq!(g.apply(Action::Pass), Err(ActionError::GameOver));
+        assert_eq!(g.players[1].base_holder, None);
+        assert_eq!(g.players[2].base_holder, None);
+        assert_eq!(g.players[0].base_holder, Some(0));
     }
 
     #[test]

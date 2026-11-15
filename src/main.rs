@@ -215,6 +215,10 @@ struct Hull {
     owner: usize,
 }
 
+/// Coloured frame of the home base of player `.0`; shows who holds it now.
+#[derive(Component)]
+struct BaseFrame(usize);
+
 /// Shared mesh/material handles for tank parts.
 #[derive(Resource)]
 struct TankAssets {
@@ -392,6 +396,7 @@ fn main() {
                 net_poll_playing,
                 handle_input,
                 sync_units,
+                sync_bases,
                 sync_hover,
                 sync_hud,
                 pulse_selected,
@@ -1141,11 +1146,12 @@ fn build_board(
         }
     }
 
-    // Bases: coloured frame around the tile.
+    // Bases: frame in the holder's colour around the tile.
     for (i, player) in game.players.iter().enumerate() {
         commands.spawn((
-            Sprite::from_color(player_color(i), Vec2::splat(CELL - 2.0)),
+            Sprite::from_color(base_color(player.base_holder), Vec2::splat(CELL - 2.0)),
             Transform::from_translation(cell_center(player.base, 0.2)),
+            BaseFrame(i),
             BoardEntity,
         ));
         commands.spawn((
@@ -1521,6 +1527,21 @@ fn pulse_selected(
         } else {
             base
         };
+    }
+}
+
+/// Frame colour for a base: its holder's colour, grey when nobody holds it.
+fn base_color(holder: Option<usize>) -> Color {
+    holder.map_or(Color::srgb(0.6, 0.6, 0.6), player_color)
+}
+
+/// Recolour base frames after captures.
+fn sync_bases(game: Res<GameRes>, mut frames: Query<(&BaseFrame, &mut Sprite)>) {
+    if !game.is_changed() {
+        return;
+    }
+    for (frame, mut sprite) in &mut frames {
+        sprite.color = base_color(game.0.players[frame.0].base_holder);
     }
 }
 

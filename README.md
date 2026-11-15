@@ -36,13 +36,16 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
 - A map is generated (plains and impassable water) and every player gets a base with one tank.
 - Players act in order. One of your tanks is preselected and blinks; click another or press Tab to cycle. One action per turn:
   - **Move** a selected tank one cell (arrows / WASD).
-  - **Produce** a new tank of strength 1 at your base (P).
+  - **Produce** a new tank of strength 1 at a base you hold (P).
   - **Raise** a selected tank's strength by 1 (R).
   - Space passes. `M` returns to the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
   Equal strength destroys both.
-- Standing a tank on an enemy base captures it: that player is eliminated and their tanks removed.
-- A player whose last tank is destroyed is eliminated.
+- Ending a move on a base you do not hold captures it; its frame takes your colour. You produce
+  at every base you hold (your home base first). A player whose home base is taken stays in
+  the game and can retake it the same way.
+- A player whose last tank is destroyed is eliminated, even if they still hold bases. Bases they
+  held turn grey (neutral) and can be captured by anyone.
 - Last player alive wins. If the last players knock each other out at once, the game is a draw.
 - The end screen offers Play again (same settings, Enter) or Menu (M).
 
