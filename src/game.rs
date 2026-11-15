@@ -14,7 +14,7 @@ pub enum Terrain {
     Water,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
 pub struct Pos {
     pub x: i32,
     pub y: i32,
@@ -37,6 +37,11 @@ impl Pos {
     pub fn manhattan(self, other: Pos) -> i32 {
         (self.x - other.x).abs() + (self.y - other.y).abs()
     }
+
+    /// King-move distance: diagonal neighbours are 1 apart.
+    pub fn chebyshev(self, other: Pos) -> i32 {
+        (self.x - other.x).abs().max((self.y - other.y).abs())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -49,9 +54,31 @@ pub enum Dir {
 
 pub const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
 
+/// Bases must keep this many free tiles between them in every direction,
+/// diagonals included.
+pub const BASE_GAP: i32 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum UnitKind {
+    /// Fights and captures bases.
+    Tank,
+    /// Strength 0, never captures, cannot be raised. Founds new bases.
+    Settler,
+}
+
+impl UnitKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            UnitKind::Tank => "tank",
+            UnitKind::Settler => "settler",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
     pub id: u32,
+    pub kind: UnitKind,
     pub owner: usize,
     pub pos: Pos,
     pub strength: u32,
@@ -62,22 +89,40 @@ pub struct Unit {
 #[derive(Clone, Debug)]
 pub struct Player {
     pub name: String,
-    /// Home base position; fixed for the whole match.
-    pub base: Pos,
-    /// Who holds this base now and may produce there. Starts as the owner;
-    /// changes when another player's tank ends a move on it; `None` once the
-    /// holder is out.
-    pub base_holder: Option<usize>,
     pub alive: bool,
+}
+
+/// A production site. `Game::bases[i]` for `i < players.len()` is player
+/// `i`'s home base; later entries were founded by settlers, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Base {
+    pub pos: Pos,
+    /// Who may produce here. Changes when another player's tank ends a move
+    /// on it; `None` once the holder is out.
+    pub holder: Option<usize>,
 }
 
 /// What a player may do on their turn. Exactly one action ends the turn.
 /// This is the only rules type that crosses the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
-    Move { unit: u32, dir: Dir },
-    Produce,
-    Raise { unit: u32 },
+    Move {
+        unit: u32,
+        dir: Dir,
+    },
+    /// New unit at the held base on `at`, or at the first held base with room
+    /// (home first) when `at` is `None`.
+    Produce {
+        kind: UnitKind,
+        at: Option<Pos>,
+    },
+    Raise {
+        unit: u32,
+    },
+    /// Turn a settler into a base on its tile.
+    Found {
+        unit: u32,
+    },
     Pass,
 }
 
@@ -89,8 +134,13 @@ pub enum ActionError {
     OffMap,
     Water,
     OwnUnitThere,
+    SettlerThere,
     NoBase,
+    NotYourBase,
     NoRoomAtBase,
+    CannotRaiseSettler,
+    NotASettler,
+    TooCloseToBase,
 }
 
 impl std::fmt::Display for ActionError {
@@ -102,8 +152,13 @@ impl std::fmt::Display for ActionError {
             ActionError::OffMap => "cannot move off the map",
             ActionError::Water => "cannot drive into water",
             ActionError::OwnUnitThere => "one of your tanks is already there",
+            ActionError::SettlerThere => "a settler is already there",
             ActionError::NoBase => "you hold no base to produce at",
+            ActionError::NotYourBase => "you do not hold that base",
             ActionError::NoRoomAtBase => "no free cell at your bases",
+            ActionError::CannotRaiseSettler => "settlers cannot be raised",
+            ActionError::NotASettler => "only settlers can found a base",
+            ActionError::TooCloseToBase => "too close to a base: keep two free tiles between bases",
         };
         f.write_str(s)
     }
@@ -123,7 +178,8 @@ pub enum Outcome {
     AttackerWon { remaining: u32 },
     DefenderWon { remaining: u32 },
     BothDestroyed,
-    Produced { unit: u32 },
+    Produced { unit: u32, kind: UnitKind },
+    Founded { base: usize },
     Raised { unit: u32, strength: u32 },
     Passed,
 }
@@ -170,6 +226,7 @@ pub struct Game {
     pub height: i32,
     terrain: Vec<Terrain>,
     pub players: Vec<Player>,
+    pub bases: Vec<Base>,
     pub units: Vec<Unit>,
     pub current: usize,
     pub turn: u32,
@@ -213,14 +270,18 @@ impl Game {
             }
         };
 
-        let players = bases
+        let players = (0..n_players)
+            .map(|i| Player {
+                name: format!("Player {}", i + 1),
+                alive: true,
+            })
+            .collect::<Vec<_>>();
+        let bases = bases
             .iter()
             .enumerate()
-            .map(|(i, &base)| Player {
-                name: format!("Player {}", i + 1),
-                base,
-                base_holder: Some(i),
-                alive: true,
+            .map(|(i, &pos)| Base {
+                pos,
+                holder: Some(i),
             })
             .collect::<Vec<_>>();
 
@@ -229,6 +290,7 @@ impl Game {
             height,
             terrain,
             players,
+            bases,
             units: Vec::new(),
             current: 0,
             turn: 1,
@@ -238,7 +300,7 @@ impl Game {
         };
         // Everyone starts with one tank on their base.
         for i in 0..n_players {
-            let base = game.players[i].base;
+            let base = game.bases[i].pos;
             game.spawn_unit(i, base, 1);
         }
         game
@@ -262,24 +324,31 @@ impl Game {
         self.units.iter().find(|u| u.id == id)
     }
 
-    pub fn base_owner(&self, p: Pos) -> Option<usize> {
-        self.players.iter().position(|pl| pl.base == p)
+    /// Index into `bases` of the base on `p`, if any.
+    pub fn base_at(&self, p: Pos) -> Option<usize> {
+        self.bases.iter().position(|b| b.pos == p)
     }
 
-    /// Positions of every base `player` currently holds, home base first.
+    /// Positions of every base `player` currently holds: home base first,
+    /// then the rest in `bases` order.
     pub fn held_bases(&self, player: usize) -> impl Iterator<Item = Pos> + '_ {
         let home = self
-            .players
+            .bases
             .get(player)
-            .filter(|p| p.base_holder == Some(player))
-            .map(|p| p.base);
+            .filter(|b| b.holder == Some(player))
+            .map(|b| b.pos);
         let others = self
-            .players
+            .bases
             .iter()
             .enumerate()
-            .filter(move |&(i, p)| i != player && p.base_holder == Some(player))
-            .map(|(_, p)| p.base);
+            .filter(move |&(i, b)| i != player && b.holder == Some(player))
+            .map(|(_, b)| b.pos);
         home.into_iter().chain(others)
+    }
+
+    /// Whether a new base on `p` keeps `BASE_GAP` free tiles to every base.
+    pub fn can_found_at(&self, p: Pos) -> bool {
+        self.bases.iter().all(|b| b.pos.chebyshev(p) > BASE_GAP)
     }
 
     pub fn alive_players(&self) -> impl Iterator<Item = usize> + '_ {
@@ -303,13 +372,22 @@ impl Game {
             return Err(ActionError::GameOver);
         }
         let me = self.current;
+        // Look up the acting unit's kind before it can be destroyed.
+        let noun = match action {
+            Action::Move { unit, .. } | Action::Raise { unit } | Action::Found { unit } => {
+                self.unit(unit).map_or("unit", |u| u.kind.name())
+            }
+            Action::Produce { kind, .. } => kind.name(),
+            Action::Pass => "unit",
+        };
         let outcome = match action {
             Action::Pass => Outcome::Passed,
-            Action::Produce => self.produce(me)?,
+            Action::Produce { kind, at } => self.produce(me, kind, at)?,
             Action::Raise { unit } => self.raise(me, unit)?,
             Action::Move { unit, dir } => self.move_unit(me, unit, dir)?,
+            Action::Found { unit } => self.found(me, unit)?,
         };
-        self.log.push(self.describe(me, action, outcome));
+        self.log.push(self.describe(me, action, outcome, noun));
         self.check_victory();
         self.advance_turn();
         Ok(outcome)
@@ -335,10 +413,15 @@ impl Game {
     }
 
     fn spawn_unit(&mut self, owner: usize, pos: Pos, strength: u32) -> u32 {
+        self.spawn(UnitKind::Tank, owner, pos, strength)
+    }
+
+    fn spawn(&mut self, kind: UnitKind, owner: usize, pos: Pos, strength: u32) -> u32 {
         let id = self.next_unit_id;
         self.next_unit_id += 1;
         self.units.push(Unit {
             id,
+            kind,
             owner,
             pos,
             strength,
@@ -347,10 +430,26 @@ impl Game {
         id
     }
 
-    /// New tank at the first held base (home first) that has a free cell on
-    /// or next to it.
-    fn produce(&mut self, me: usize) -> Result<Outcome, ActionError> {
-        let bases: Vec<Pos> = self.held_bases(me).collect();
+    /// New unit on or next to the chosen held base, or the first held base
+    /// (home first) with a free cell. Tanks start at strength 1, settlers at 0.
+    fn produce(
+        &mut self,
+        me: usize,
+        kind: UnitKind,
+        at: Option<Pos>,
+    ) -> Result<Outcome, ActionError> {
+        let bases: Vec<Pos> = match at {
+            Some(p) => {
+                let held = self
+                    .base_at(p)
+                    .is_some_and(|i| self.bases[i].holder == Some(me));
+                if !held {
+                    return Err(ActionError::NotYourBase);
+                }
+                vec![p]
+            }
+            None => self.held_bases(me).collect(),
+        };
         if bases.is_empty() {
             return Err(ActionError::NoBase);
         }
@@ -363,12 +462,18 @@ impl Game {
                     && self.unit_at(p).is_none()
             })
             .ok_or(ActionError::NoRoomAtBase)?;
-        let unit = self.spawn_unit(me, spot, 1);
-        Ok(Outcome::Produced { unit })
+        let strength = match kind {
+            UnitKind::Tank => 1,
+            UnitKind::Settler => 0,
+        };
+        let unit = self.spawn(kind, me, spot, strength);
+        Ok(Outcome::Produced { unit, kind })
     }
 
     fn raise(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
-        self.own_unit(me, id)?;
+        if self.own_unit(me, id)?.kind == UnitKind::Settler {
+            return Err(ActionError::CannotRaiseSettler);
+        }
         let u = self.unit_mut(id);
         u.strength += 1;
         let strength = u.strength;
@@ -376,9 +481,9 @@ impl Game {
     }
 
     fn move_unit(&mut self, me: usize, id: u32, dir: Dir) -> Result<Outcome, ActionError> {
-        let (from, strength) = {
+        let (from, strength, kind) = {
             let u = self.own_unit(me, id)?;
-            (u.pos, u.strength)
+            (u.pos, u.strength, u.kind)
         };
         let to = from.step(dir);
         if !self.in_bounds(to) {
@@ -389,6 +494,14 @@ impl Game {
         }
         if self.unit_at(to).is_some_and(|u| u.owner == me) {
             return Err(ActionError::OwnUnitThere);
+        }
+        // Settlers never fight each other; the tile is simply taken.
+        if kind == UnitKind::Settler
+            && self
+                .unit_at(to)
+                .is_some_and(|u| u.kind == UnitKind::Settler)
+        {
+            return Err(ActionError::SettlerThere);
         }
         self.unit_mut(id).facing = dir;
 
@@ -423,15 +536,34 @@ impl Game {
             },
         };
 
-        // Ending a move on a base we do not hold takes it over.
-        if self.unit(id).is_some() {
-            if let Some(home_of) = self.base_owner(to) {
-                if self.players[home_of].base_holder != Some(me) {
-                    self.capture(home_of, me);
+        // A tank ending its move on a base we do not hold takes it over.
+        if kind == UnitKind::Tank && self.unit(id).is_some() {
+            if let Some(base) = self.base_at(to) {
+                if self.bases[base].holder != Some(me) {
+                    self.capture(base, me);
                 }
             }
         }
         Ok(outcome)
+    }
+
+    fn found(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
+        let u = self.own_unit(me, id)?;
+        if u.kind != UnitKind::Settler {
+            return Err(ActionError::NotASettler);
+        }
+        let pos = u.pos;
+        if !self.can_found_at(pos) {
+            return Err(ActionError::TooCloseToBase);
+        }
+        self.remove_unit(id);
+        self.bases.push(Base {
+            pos,
+            holder: Some(me),
+        });
+        Ok(Outcome::Founded {
+            base: self.bases.len() - 1,
+        })
     }
 
     /// Take `player` out of the match (surrender or lost connection). Their
@@ -452,24 +584,23 @@ impl Game {
         }
     }
 
-    fn capture(&mut self, home_of: usize, by: usize) {
-        self.players[home_of].base_holder = Some(by);
-        let msg = if home_of == by {
-            format!("{} took back their base!", self.players[by].name)
-        } else {
-            format!(
-                "{} captured {}'s base!",
-                self.players[by].name, self.players[home_of].name
-            )
+    fn capture(&mut self, base: usize, by: usize) {
+        let from = self.bases[base].holder;
+        self.bases[base].holder = Some(by);
+        let who = &self.players[by].name;
+        let msg = match from {
+            _ if base == by => format!("{who} took back their home base!"),
+            Some(prev) => format!("{who} captured a base from {}!", self.players[prev].name),
+            None => format!("{who} captured a neutral base!"),
         };
         self.log.push(msg);
     }
 
     /// Bases held by a player who is out become neutral.
     fn release_bases(&mut self, player: usize) {
-        for p in &mut self.players {
-            if p.base_holder == Some(player) {
-                p.base_holder = None;
+        for b in &mut self.bases {
+            if b.holder == Some(player) {
+                b.holder = None;
             }
         }
     }
@@ -482,7 +613,7 @@ impl Game {
                 self.players[i].alive = false;
                 self.release_bases(i);
                 self.log.push(format!(
-                    "{} has no tanks left and is out.",
+                    "{} has no units left and is out.",
                     self.players[i].name
                 ));
             }
@@ -520,23 +651,28 @@ impl Game {
         }
     }
 
-    fn describe(&self, me: usize, action: Action, outcome: Outcome) -> String {
+    fn describe(&self, me: usize, action: Action, outcome: Outcome, noun: &str) -> String {
         let name = &self.players[me].name;
         match (action, outcome) {
             (_, Outcome::Passed) => format!("{name} passed."),
-            (_, Outcome::Produced { unit }) => format!("{name} produced tank #{unit}."),
-            (_, Outcome::Raised { unit, strength }) => {
-                format!("{name} raised tank #{unit} to strength {strength}.")
+            (_, Outcome::Produced { unit, kind }) => {
+                format!("{name} produced {} #{unit}.", kind.name())
             }
-            (Action::Move { unit, .. }, Outcome::Moved) => format!("{name} moved tank #{unit}."),
+            (_, Outcome::Raised { unit, strength }) => {
+                format!("{name} raised {noun} #{unit} to strength {strength}.")
+            }
+            (Action::Found { unit }, Outcome::Founded { .. }) => {
+                format!("{name}'s settler #{unit} founded a new base.")
+            }
+            (Action::Move { unit, .. }, Outcome::Moved) => format!("{name} moved {noun} #{unit}."),
             (Action::Move { unit, .. }, Outcome::AttackerWon { remaining }) => {
-                format!("{name}'s tank #{unit} won the fight, {remaining} strength left.")
+                format!("{name}'s {noun} #{unit} won the fight, {remaining} strength left.")
             }
             (Action::Move { unit, .. }, Outcome::DefenderWon { remaining }) => {
-                format!("{name}'s tank #{unit} was destroyed; defender has {remaining} left.")
+                format!("{name}'s {noun} #{unit} was destroyed; defender has {remaining} left.")
             }
             (Action::Move { unit, .. }, Outcome::BothDestroyed) => {
-                format!("{name}'s tank #{unit} and the defender destroyed each other.")
+                format!("{name}'s {noun} #{unit} and the defender destroyed each other.")
             }
             _ => format!("{name} acted."),
         }
@@ -644,8 +780,8 @@ mod tests {
     fn arena() -> Game {
         let mut g = Game::new(6, 6, 2, 42);
         g.terrain = vec![Terrain::Plain; 36];
-        g.players[0].base = Pos::new(0, 0);
-        g.players[1].base = Pos::new(5, 5);
+        g.bases[0].pos = Pos::new(0, 0);
+        g.bases[1].pos = Pos::new(5, 5);
         g.units.clear();
         g
     }
@@ -655,10 +791,12 @@ mod tests {
         let g = Game::new(16, 12, 4, 7);
         assert_eq!(g.players.len(), 4);
         assert_eq!(g.units.len(), 4);
-        for (i, p) in g.players.iter().enumerate() {
-            let u = g.unit_at(p.base).expect("tank on base");
+        assert_eq!(g.bases.len(), 4);
+        for (i, b) in g.bases.iter().enumerate() {
+            let u = g.unit_at(b.pos).expect("tank on base");
             assert_eq!(u.owner, i);
-            assert_eq!(g.terrain_at(p.base), Terrain::Plain);
+            assert_eq!(b.holder, Some(i));
+            assert_eq!(g.terrain_at(b.pos), Terrain::Plain);
         }
     }
 
@@ -667,17 +805,14 @@ mod tests {
         let a = Game::new(16, 12, 3, 99);
         let b = Game::new(16, 12, 3, 99);
         assert_eq!(a.terrain, b.terrain);
-        assert_eq!(
-            a.players.iter().map(|p| p.base).collect::<Vec<_>>(),
-            b.players.iter().map(|p| p.base).collect::<Vec<_>>()
-        );
+        assert_eq!(a.bases, b.bases);
     }
 
     #[test]
     fn bases_are_connected() {
         for seed in 0..50 {
             let g = Game::new(12, 10, 4, seed);
-            let bases: Vec<Pos> = g.players.iter().map(|p| p.base).collect();
+            let bases: Vec<Pos> = g.bases.iter().map(|b| b.pos).collect();
             assert!(
                 all_connected(&g.terrain, g.width, g.height, &bases),
                 "seed {seed}"
@@ -814,13 +949,24 @@ mod tests {
     fn produce_uses_base_then_neighbours() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1); // keeps player 2 in the game
-        let first = g.apply(Action::Produce).unwrap();
-        let Outcome::Produced { unit } = first else {
+        let first = g
+            .apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: None,
+            })
+            .unwrap();
+        let Outcome::Produced { unit, .. } = first else {
             panic!()
         };
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
         g.apply(Action::Pass).unwrap(); // player 2
-        let Outcome::Produced { unit } = g.apply(Action::Produce).unwrap() else {
+        let Outcome::Produced { unit, .. } = g
+            .apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: None,
+            })
+            .unwrap()
+        else {
             panic!()
         };
         let p = g.unit(unit).unwrap().pos;
@@ -874,24 +1020,36 @@ mod tests {
             dir: Dir::Right,
         })
         .unwrap();
-        assert_eq!(g.players[1].base_holder, Some(0));
+        assert_eq!(g.bases[1].holder, Some(0));
         assert!(g.players[1].alive, "still has a tank");
         assert!(g.unit(far).is_some());
         assert!(g.result.is_none());
-        assert_eq!(g.apply(Action::Produce), Err(ActionError::NoBase));
+        assert_eq!(
+            g.apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: None
+            }),
+            Err(ActionError::NoBase)
+        );
         assert_eq!(g.current, 1, "failed produce keeps the turn");
     }
 
     #[test]
     fn captor_produces_at_home_first_then_captured_base() {
         let mut g = arena();
-        g.players[1].base_holder = Some(0);
+        g.bases[1].holder = Some(0);
         g.spawn_unit(1, Pos::new(3, 3), 1); // keeps player 2 in the game
                                             // Fill player 1's home and its neighbours.
         for p in [Pos::new(0, 0), Pos::new(1, 0), Pos::new(0, 1)] {
             g.spawn_unit(0, p, 1);
         }
-        let Outcome::Produced { unit } = g.apply(Action::Produce).unwrap() else {
+        let Outcome::Produced { unit, .. } = g
+            .apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: None,
+            })
+            .unwrap()
+        else {
             panic!()
         };
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(5, 5));
@@ -900,7 +1058,7 @@ mod tests {
     #[test]
     fn owner_can_retake_base() {
         let mut g = arena();
-        g.players[1].base_holder = Some(0);
+        g.bases[1].holder = Some(0);
         g.spawn_unit(0, Pos::new(0, 0), 1);
         let b = g.spawn_unit(1, Pos::new(5, 4), 1);
         g.apply(Action::Pass).unwrap();
@@ -909,7 +1067,7 @@ mod tests {
             dir: Dir::Up,
         })
         .unwrap();
-        assert_eq!(g.players[1].base_holder, Some(1));
+        assert_eq!(g.bases[1].holder, Some(1));
         assert!(g.log.iter().any(|l| l.contains("took back")));
     }
 
@@ -922,9 +1080,9 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            g.players[i].base = base;
+            g.bases[i].pos = base;
         }
-        g.players[2].base_holder = Some(1);
+        g.bases[2].holder = Some(1);
         let a = g.spawn_unit(0, Pos::new(1, 1), 2);
         g.spawn_unit(1, Pos::new(2, 1), 1);
         g.spawn_unit(2, Pos::new(6, 6), 1);
@@ -934,9 +1092,177 @@ mod tests {
         })
         .unwrap();
         assert!(!g.players[1].alive);
-        assert_eq!(g.players[1].base_holder, None);
-        assert_eq!(g.players[2].base_holder, None);
-        assert_eq!(g.players[0].base_holder, Some(0));
+        assert_eq!(g.bases[1].holder, None);
+        assert_eq!(g.bases[2].holder, None);
+        assert_eq!(g.bases[0].holder, Some(0));
+    }
+
+    fn settler(g: &mut Game, owner: usize, pos: Pos) -> u32 {
+        g.spawn(UnitKind::Settler, owner, pos, 0)
+    }
+
+    #[test]
+    fn produce_settler_has_zero_strength_and_cannot_be_raised() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(5, 5), 1);
+        let Outcome::Produced { unit, kind } = g
+            .apply(Action::Produce {
+                kind: UnitKind::Settler,
+                at: None,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(kind, UnitKind::Settler);
+        assert_eq!(g.unit(unit).unwrap().strength, 0);
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(
+            g.apply(Action::Raise { unit }),
+            Err(ActionError::CannotRaiseSettler)
+        );
+    }
+
+    #[test]
+    fn produce_at_chosen_base_only_if_held() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        g.bases.push(Base {
+            pos: Pos::new(3, 0),
+            holder: Some(0),
+        });
+        let Outcome::Produced { unit, .. } = g
+            .apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: Some(Pos::new(3, 0)),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(3, 0));
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(
+            g.apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: Some(Pos::new(5, 5)),
+            }),
+            Err(ActionError::NotYourBase)
+        );
+    }
+
+    #[test]
+    fn settler_founds_base_and_is_consumed() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(5, 5), 1);
+        g.spawn_unit(0, Pos::new(0, 0), 1); // founding must not leave player 1 unitless
+        let s = settler(&mut g, 0, Pos::new(3, 0));
+        assert_eq!(
+            g.apply(Action::Found { unit: s }),
+            Ok(Outcome::Founded { base: 2 })
+        );
+        assert!(g.unit(s).is_none());
+        assert_eq!(
+            g.bases[2],
+            Base {
+                pos: Pos::new(3, 0),
+                holder: Some(0)
+            }
+        );
+    }
+
+    #[test]
+    fn founding_needs_two_free_tiles_to_every_base() {
+        let mut g = arena();
+        // Home bases at (0,0) and (5,5).
+        for (pos, ok) in [
+            (Pos::new(2, 0), false),
+            (Pos::new(2, 2), false),
+            (Pos::new(3, 0), true),
+            (Pos::new(3, 3), false),
+            (Pos::new(2, 3), true),
+            (Pos::new(3, 2), true),
+        ] {
+            assert_eq!(g.can_found_at(pos), ok, "{pos:?}");
+        }
+        let s = settler(&mut g, 0, Pos::new(2, 1));
+        assert_eq!(
+            g.apply(Action::Found { unit: s }),
+            Err(ActionError::TooCloseToBase)
+        );
+        let t = g.spawn_unit(0, Pos::new(3, 0), 1);
+        assert_eq!(
+            g.apply(Action::Found { unit: t }),
+            Err(ActionError::NotASettler)
+        );
+    }
+
+    #[test]
+    fn settler_blocked_by_settler_and_loses_to_tank() {
+        let mut g = arena();
+        let s = settler(&mut g, 0, Pos::new(2, 2));
+        settler(&mut g, 1, Pos::new(3, 2));
+        let tank = g.spawn_unit(1, Pos::new(2, 3), 2);
+        assert_eq!(
+            g.apply(Action::Move {
+                unit: s,
+                dir: Dir::Right
+            }),
+            Err(ActionError::SettlerThere)
+        );
+        assert_eq!(
+            g.apply(Action::Move {
+                unit: s,
+                dir: Dir::Up
+            }),
+            Ok(Outcome::DefenderWon { remaining: 2 })
+        );
+        assert!(g.unit(s).is_none());
+        assert_eq!(g.unit(tank).unwrap().strength, 2);
+    }
+
+    #[test]
+    fn tank_destroys_settler_at_no_cost() {
+        let mut g = arena();
+        let a = g.spawn_unit(0, Pos::new(2, 2), 2);
+        let s = settler(&mut g, 1, Pos::new(3, 2));
+        g.spawn_unit(1, Pos::new(5, 5), 1);
+        assert_eq!(
+            g.apply(Action::Move {
+                unit: a,
+                dir: Dir::Right
+            }),
+            Ok(Outcome::AttackerWon { remaining: 2 })
+        );
+        assert!(g.unit(s).is_none());
+    }
+
+    #[test]
+    fn settler_does_not_capture_bases() {
+        let mut g = arena();
+        let s = settler(&mut g, 0, Pos::new(4, 5));
+        g.spawn_unit(1, Pos::new(0, 5), 1);
+        g.apply(Action::Move {
+            unit: s,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        assert_eq!(g.bases[1].holder, Some(1));
+    }
+
+    #[test]
+    fn player_with_only_settlers_stays_in() {
+        let mut g = arena();
+        let a = g.spawn_unit(0, Pos::new(2, 2), 3);
+        g.spawn_unit(1, Pos::new(3, 2), 1);
+        settler(&mut g, 1, Pos::new(5, 0));
+        g.apply(Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        assert!(g.players[1].alive);
+        assert!(g.result.is_none());
     }
 
     #[test]

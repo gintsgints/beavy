@@ -489,7 +489,15 @@ mod tests {
             room.act(1, Action::Raise { unit: 999 }),
             Err(RoomError::Rule(ActionError::NoSuchUnit))
         );
-        assert!(room.act(1, Action::Produce).is_ok());
+        assert!(room
+            .act(
+                1,
+                Action::Produce {
+                    kind: crate::game::UnitKind::Tank,
+                    at: None
+                }
+            )
+            .is_ok());
     }
 
     #[test]

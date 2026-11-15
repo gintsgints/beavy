@@ -9,7 +9,7 @@ mod server;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use game::{Action, Dir, Game, GameOver, Pos, Terrain};
+use game::{Action, Dir, Game, GameOver, Pos, Terrain, UnitKind};
 use net::{Client, ClientMsg, Event, MatchSettings, ServerMsg};
 use std::fmt::Write as _;
 
@@ -215,9 +215,9 @@ struct Hull {
     owner: usize,
 }
 
-/// Coloured frame of the home base of player `.0`; shows who holds it now.
+/// Base tile sprites; rebuilt whenever bases are founded or change hands.
 #[derive(Component)]
-struct BaseFrame(usize);
+struct BaseFrame;
 
 /// Shared mesh/material handles for tank parts.
 #[derive(Resource)]
@@ -1146,21 +1146,6 @@ fn build_board(
         }
     }
 
-    // Bases: frame in the holder's colour around the tile.
-    for (i, player) in game.players.iter().enumerate() {
-        commands.spawn((
-            Sprite::from_color(base_color(player.base_holder), Vec2::splat(CELL - 2.0)),
-            Transform::from_translation(cell_center(player.base, 0.2)),
-            BaseFrame(i),
-            BoardEntity,
-        ));
-        commands.spawn((
-            Sprite::from_color(Color::srgb(0.22, 0.22, 0.22), Vec2::splat(CELL - 14.0)),
-            Transform::from_translation(cell_center(player.base, 0.3)),
-            BoardEntity,
-        ));
-    }
-
     // Hover and selection highlights.
     commands.spawn((
         Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 0.18), Vec2::splat(CELL)),
@@ -1318,11 +1303,27 @@ fn handle_input(
         } else {
             game.0
                 .log
-                .push("Select one of your tanks first (click it).".into());
+                .push("Select one of your units first (click it).".into());
             None
         }
-    } else if keys.just_pressed(KeyCode::KeyP) {
-        Some(Action::Produce)
+    } else if keys.any_just_pressed([KeyCode::KeyP, KeyCode::KeyE]) {
+        let kind = if keys.just_pressed(KeyCode::KeyP) {
+            UnitKind::Tank
+        } else {
+            UnitKind::Settler
+        };
+        // Produce at the held base under the cursor; otherwise let the rules pick.
+        let g: &Game = &game.0;
+        let at = cursor_cell(&windows, &cameras)
+            .filter(|&p| g.base_at(p).is_some_and(|i| g.bases[i].holder == Some(me)));
+        Some(Action::Produce { kind, at })
+    } else if keys.just_pressed(KeyCode::KeyF) {
+        if let Some(unit) = selected.0 {
+            Some(Action::Found { unit })
+        } else {
+            game.0.log.push("Select a settler to found a base.".into());
+            None
+        }
     } else if keys.just_pressed(KeyCode::KeyR) {
         if let Some(unit) = selected.0 {
             Some(Action::Raise { unit })
@@ -1422,7 +1423,10 @@ fn sync_units(
         commands.entity(e).despawn();
     }
     for u in &game.0.units {
-        spawn_tank(&mut commands, &assets, u);
+        match u.kind {
+            UnitKind::Tank => spawn_tank(&mut commands, &assets, u),
+            UnitKind::Settler => spawn_settler(&mut commands, u),
+        }
     }
 }
 
@@ -1510,6 +1514,47 @@ fn spawn_tank(commands: &mut Commands, assets: &TankAssets, u: &game::Unit) {
         });
 }
 
+/// Top-down settler wagon: canvas cover in the owner's colour on a dark bed
+/// with four wheels. No strength badge; settlers are always 0.
+fn spawn_settler(commands: &mut Commands, u: &game::Unit) {
+    let dark = Color::srgb(0.13, 0.13, 0.14);
+    let bed = Color::srgb(0.45, 0.32, 0.18);
+    commands
+        .spawn((
+            Transform::from_translation(cell_center(u.pos, 1.0)),
+            Visibility::default(),
+            UnitMarker,
+            BoardEntity,
+        ))
+        .with_children(|root| {
+            for (x, y) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+                root.spawn((
+                    Sprite::from_color(dark, Vec2::new(CELL * 0.16, CELL * 0.10)),
+                    Transform::from_xyz(x * CELL * 0.22, y * CELL * 0.24, 0.0),
+                ));
+            }
+            root.spawn((
+                Sprite::from_color(bed, Vec2::new(CELL * 0.62, CELL * 0.42)),
+                Transform::from_xyz(0.0, 0.0, 0.05),
+            ));
+            root.spawn((
+                Sprite::from_color(player_color(u.owner), Vec2::new(CELL * 0.50, CELL * 0.32)),
+                Transform::from_xyz(0.0, 0.0, 0.1),
+                Hull {
+                    unit: u.id,
+                    owner: u.owner,
+                },
+            ));
+            // Cover hoops.
+            for k in -1..=1 {
+                root.spawn((
+                    Sprite::from_color(Color::WHITE, Vec2::new(CELL * 0.04, CELL * 0.32)),
+                    Transform::from_xyz(grid_f32(k) * CELL * 0.14, 0.0, 0.15),
+                ));
+            }
+        });
+}
+
 /// Pulse the hull of the selected tank so the active player sees which tank
 /// their keys will drive. Online, a window off-turn keeps its selection but
 /// stops pulsing, so only the player to act has a blinking tank.
@@ -1535,13 +1580,32 @@ fn base_color(holder: Option<usize>) -> Color {
     holder.map_or(Color::srgb(0.6, 0.6, 0.6), player_color)
 }
 
-/// Recolour base frames after captures.
-fn sync_bases(game: Res<GameRes>, mut frames: Query<(&BaseFrame, &mut Sprite)>) {
+/// Rebuild base tiles whenever the game state changes: a frame in the
+/// holder's colour around a dark tile. Despawn-and-respawn like units.
+fn sync_bases(
+    mut commands: Commands,
+    game: Res<GameRes>,
+    existing: Query<Entity, With<BaseFrame>>,
+) {
     if !game.is_changed() {
         return;
     }
-    for (frame, mut sprite) in &mut frames {
-        sprite.color = base_color(game.0.players[frame.0].base_holder);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    for base in &game.0.bases {
+        commands.spawn((
+            Sprite::from_color(base_color(base.holder), Vec2::splat(CELL - 2.0)),
+            Transform::from_translation(cell_center(base.pos, 0.2)),
+            BaseFrame,
+            BoardEntity,
+        ));
+        commands.spawn((
+            Sprite::from_color(Color::srgb(0.22, 0.22, 0.22), Vec2::splat(CELL - 14.0)),
+            Transform::from_translation(cell_center(base.pos, 0.3)),
+            BaseFrame,
+            BoardEntity,
+        ));
     }
 }
 
@@ -1737,12 +1801,12 @@ fn sync_hud(
             if !p.alive {
                 return format!("{}: out", p.name);
             }
-            let (count, power) = g
-                .units
-                .iter()
-                .filter(|u| u.owner == i)
-                .fold((0, 0), |(c, p), u| (c + 1, p + u.strength));
-            format!("{}: {}t/{}p", p.name, count, power)
+            let own = || g.units.iter().filter(move |u| u.owner == i);
+            let tanks = own().filter(|u| u.kind == UnitKind::Tank).count();
+            let settlers = own().filter(|u| u.kind == UnitKind::Settler).count();
+            let power: u32 = own().map(|u| u.strength).sum();
+            let bases = g.held_bases(i).count();
+            format!("{}: {tanks}t {settlers}s {bases}b {power}p", p.name)
         })
         .collect();
     s.push_str(&roster.join("  |  "));
@@ -1751,14 +1815,18 @@ fn sync_hud(
     if let Some(u) = selected.0.and_then(|id| g.unit(id)) {
         let _ = writeln!(
             s,
-            "Selected: tank #{} at ({}, {}) strength {}",
-            u.id, u.pos.x, u.pos.y, u.strength
+            "Selected: {} #{} at ({}, {}) strength {}",
+            u.kind.name(),
+            u.id,
+            u.pos.x,
+            u.pos.y,
+            u.strength
         );
     } else if g.result.is_none() {
-        s.push_str("Selected: none (click one of your tanks or press Tab)\n");
+        s.push_str("Selected: none (click one of your units or press Tab)\n");
     }
 
-    s.push_str("Blinking tank = selected (click or Tab to change) | Arrows move | P produce | R raise | Space pass | M menu\n");
+    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise | F found base | Space pass | M menu\n");
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }
