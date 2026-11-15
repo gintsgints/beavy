@@ -19,7 +19,7 @@ const HUD_H: f32 = 115.0;
 const MARGIN: f32 = 24.0;
 const MIN_WIN_W: f32 = 760.0;
 const MENU_W: f32 = 760.0;
-const MENU_H: f32 = 700.0;
+const MENU_H: f32 = 760.0;
 
 const MIN_PLAYERS: usize = 2;
 const MAX_PLAYERS: usize = 8;
@@ -27,6 +27,10 @@ const MIN_W: i32 = 6;
 const MAX_W: i32 = 40;
 const MIN_H: i32 = 6;
 const MAX_H: i32 = 30;
+/// Online: how long a dropped player's seat is held (seconds; 0 = resign at once).
+const DEFAULT_RECONNECT_SECS: u32 = 60;
+const MAX_RECONNECT_SECS: u32 = 600;
+const RECONNECT_STEP: u32 = 15;
 
 // ---------------------------------------------------------------------------
 // Settings (prefilled from the command line, edited in the menu)
@@ -55,6 +59,8 @@ struct Settings {
     name: String,
     /// Room code: chosen by the host, typed by joiners.
     code: String,
+    /// Host only: seconds a dropped player may take to reconnect.
+    reconnect_secs: u32,
     /// `--host` / `--join` on the command line: connect without waiting for Enter.
     autostart: bool,
 }
@@ -66,6 +72,7 @@ impl Settings {
             height: self.height,
             players: self.players,
             seed: self.seed,
+            reconnect_secs: self.reconnect_secs,
         }
     }
 }
@@ -92,6 +99,7 @@ fn parse_args() -> Launch {
         addr: net::DEFAULT_ADDR.to_string(),
         name: String::new(),
         code: String::new(),
+        reconnect_secs: DEFAULT_RECONNECT_SECS,
         autostart: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -103,6 +111,9 @@ fn parse_args() -> Launch {
             ("--width" | "-w", Some(v)) => cfg.width = v.parse().expect("--width N"),
             ("--height" | "-h", Some(v)) => cfg.height = v.parse().expect("--height N"),
             ("--seed" | "-s", Some(v)) => cfg.seed = v.parse().expect("--seed N"),
+            ("--reconnect", Some(v)) => {
+                cfg.reconnect_secs = v.parse().expect("--reconnect SECS");
+            }
             ("--serve", Some(v)) => return Launch::Serve(v.clone()),
             ("--connect" | "-c", Some(v)) => cfg.addr.clone_from(v),
             ("--name" | "-n", Some(v)) => cfg.name.clone_from(v),
@@ -120,6 +131,7 @@ fn parse_args() -> Launch {
                 println!(
                     "usage: beavy [--players N] [--width N] [--height N] [--seed N]\n\
                      \x20      [--connect HOST:PORT] [--name NAME] [--host CODE | --join CODE]\n\
+                     \x20      [--reconnect SECS]   (host: seat hold time, default 60, 0 = off)\n\
                      \x20      beavy --serve HOST:PORT   (run a game server)"
                 );
                 std::process::exit(0);
@@ -142,6 +154,7 @@ impl Settings {
         // Game::new needs 5 cells per player.
         let by_area = usize::try_from(self.width * self.height / 5).unwrap_or(0);
         self.players = self.players.clamp(MIN_PLAYERS, MAX_PLAYERS.min(by_area));
+        self.reconnect_secs = self.reconnect_secs.min(MAX_RECONNECT_SECS);
     }
 }
 
@@ -242,6 +255,7 @@ enum Field {
     Width,
     Height,
     Seed,
+    Reconnect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -394,6 +408,7 @@ fn main() {
             Update,
             (
                 net_poll_playing,
+                reconnect_keys,
                 handle_input,
                 sync_units,
                 sync_bases,
@@ -495,22 +510,9 @@ fn build_menu(
                 ("Board width", Field::Width),
                 ("Board height", Field::Height),
                 ("Map seed", Field::Seed),
+                ("Reconnect time", Field::Reconnect),
             ] {
-                menu_row(root, label, |row| {
-                    spawn_button(row, "-", MenuAction::Dec(field), BTN, 44.0, &font(24.0));
-                    row.spawn((
-                        Text::new(""),
-                        font(24.0),
-                        TextColor(Color::WHITE),
-                        TextLayout::new_with_justify(JustifyText::Center),
-                        Node {
-                            width: Val::Px(110.0),
-                            ..default()
-                        },
-                        ValueText(field),
-                    ));
-                    spawn_button(row, "+", MenuAction::Inc(field), BTN, 44.0, &font(24.0));
-                });
+                menu_row(root, label, |row| spawn_stepper(row, field));
             }
 
             menu_row(root, "Mode", |row| {
@@ -565,6 +567,23 @@ fn build_menu(
 }
 
 /// A labelled row of controls.
+/// `-  value  +` controls for a numeric setting.
+fn spawn_stepper(row: &mut ChildSpawnerCommands, field: Field) {
+    spawn_button(row, "-", MenuAction::Dec(field), BTN, 44.0, &font(24.0));
+    row.spawn((
+        Text::new(""),
+        font(24.0),
+        TextColor(Color::WHITE),
+        TextLayout::new_with_justify(JustifyText::Center),
+        Node {
+            width: Val::Px(110.0),
+            ..default()
+        },
+        ValueText(field),
+    ));
+    spawn_button(row, "+", MenuAction::Inc(field), BTN, 44.0, &font(24.0));
+}
+
 fn menu_row(
     root: &mut ChildSpawnerCommands,
     label: &str,
@@ -692,6 +711,13 @@ fn adjust(settings: &mut Settings, field: Field, delta: i32) {
         Field::Seed => {
             let step = if delta > 0 { 1 } else { SEED_MOD - 1 };
             settings.seed = (settings.seed + step) % SEED_MOD;
+        }
+        Field::Reconnect => {
+            settings.reconnect_secs = if delta >= 0 {
+                settings.reconnect_secs + RECONNECT_STEP
+            } else {
+                settings.reconnect_secs.saturating_sub(RECONNECT_STEP)
+            };
         }
     }
     settings.clamp();
@@ -927,6 +953,10 @@ fn sync_menu_values(
             Field::Width => settings.width.to_string(),
             Field::Height => settings.height.to_string(),
             Field::Seed => settings.seed.to_string(),
+            Field::Reconnect => match settings.reconnect_secs {
+                0 => "off".to_string(),
+                secs => format!("{secs}s"),
+            },
         };
     }
     for (field, mut text) in &mut fields {
@@ -1358,6 +1388,35 @@ fn handle_input(
     }
 }
 
+/// Online, after the connection dropped (or desynced): Enter joins the same
+/// room again. The server hands back our held seat and replays the match.
+fn reconnect_keys(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    net: Option<Res<Net>>,
+    mut game: ResMut<GameRes>,
+    mut settings: ResMut<Settings>,
+    mut status: ResMut<MenuStatus>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    let Some(net) = net else { return };
+    if net.lost.is_none() || !keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]) {
+        return;
+    }
+    settings.mode = Mode::Join;
+    settings.code.clone_from(&net.code);
+    if let Some(name) = net.slot.and_then(|i| net.roster.get(i).cloned().flatten()) {
+        settings.name = name;
+    }
+    status.0.clear();
+    begin_match(&settings, &mut commands, &mut next_state, &mut status);
+    if !status.0.is_empty() {
+        game.0
+            .log
+            .push(format!("{} Press Enter to retry.", status.0));
+    }
+}
+
 /// Online: apply what the server broadcasts.
 fn net_poll_playing(
     net: Option<ResMut<Net>>,
@@ -1369,9 +1428,10 @@ fn net_poll_playing(
         match event {
             Event::Msg(ServerMsg::Applied { slot, action }) => {
                 if game.0.current != slot {
-                    game.0
-                        .log
-                        .push("Out of sync with the server; return to the menu (M).".into());
+                    game.0.log.push(
+                        "Out of sync with the server. Press Enter to reload the match, M for the menu."
+                            .into(),
+                    );
                     net.lost = Some("desync".into());
                     return;
                 }
@@ -1384,11 +1444,21 @@ fn net_poll_playing(
                 game.0.log.push(format!("Not allowed: {why}."));
             }
             Event::Msg(ServerMsg::Roster { names }) => net.roster = names,
+            Event::Msg(ServerMsg::Away { slot, secs }) => {
+                let name = game.0.players[slot].name.clone();
+                game.0.log.push(format!(
+                    "{name} lost connection; their seat is held for {secs}s."
+                ));
+            }
+            Event::Msg(ServerMsg::Back { slot }) => {
+                let name = game.0.players[slot].name.clone();
+                game.0.log.push(format!("{name} is back."));
+            }
             Event::Msg(_) => {}
             Event::Disconnected(why) => {
-                game.0
-                    .log
-                    .push(format!("Connection lost: {why}. Press M for the menu."));
+                game.0.log.push(format!(
+                    "Connection lost: {why}. Press Enter to reconnect, M for the menu."
+                ));
                 net.lost = Some(why);
                 return;
             }

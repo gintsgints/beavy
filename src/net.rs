@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
@@ -22,6 +23,10 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 pub const MAX_NAME_LEN: usize = 16;
 pub const MAX_CODE_LEN: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Reconnect tickets are unique across rooms, so a timer left over from a
+/// closed room can never match a seat in a new room with the same code.
+static NEXT_TICKET: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Protocol
@@ -34,6 +39,9 @@ pub struct MatchSettings {
     pub height: i32,
     pub players: usize,
     pub seed: u64,
+    /// How long a seat is held for a player who drops mid-game before they
+    /// resign. 0 resigns at once.
+    pub reconnect_secs: u32,
 }
 
 impl MatchSettings {
@@ -45,6 +53,12 @@ impl MatchSettings {
         if !(min_w..=max_w).contains(&self.width) || !(min_h..=max_h).contains(&self.height) {
             return Err(format!(
                 "board must be {min_w}-{max_w} wide and {min_h}-{max_h} high"
+            ));
+        }
+        if self.reconnect_secs > crate::MAX_RECONNECT_SECS {
+            return Err(format!(
+                "reconnect time must be 0-{} seconds",
+                crate::MAX_RECONNECT_SECS
             ));
         }
         let by_area = usize::try_from(self.width * self.height / 5).unwrap_or(0);
@@ -67,7 +81,8 @@ pub enum ClientMsg {
         name: String,
         settings: MatchSettings,
     },
-    /// Take the first free seat in an existing room.
+    /// Take the first free seat in an existing room, or, once it has started,
+    /// a seat held for a dropped player (the one with this name if any).
     Join { code: String, name: String },
     /// Play the given action; only accepted on your turn.
     Act(Action),
@@ -83,12 +98,17 @@ pub enum ServerMsg {
     },
     /// Seats changed. `None` is an open seat.
     Roster { names: Vec<Option<String>> },
-    /// Every seat is taken; seat 0 moves first.
+    /// Every seat is taken; seat 0 moves first. A player rejoining a running
+    /// game gets this followed by every `Applied`/`Resigned` so far.
     Started,
     /// A move was accepted. Everyone applies it locally.
     Applied { slot: usize, action: Action },
     /// A seat was vacated during play; that player resigns.
     Resigned { slot: usize },
+    /// The player in `slot` dropped; their seat is held for `secs` seconds.
+    Away { slot: usize, secs: u32 },
+    /// The player in `slot` reconnected.
+    Back { slot: usize },
     /// Your last request was refused. Nothing changed.
     Rejected(String),
 }
@@ -152,7 +172,9 @@ impl fmt::Display for RoomError {
             RoomError::CodeTaken => f.write_str("that room code is already in use"),
             RoomError::NoSuchRoom => f.write_str("no room with that code"),
             RoomError::Full => f.write_str("that room is full"),
-            RoomError::AlreadyStarted => f.write_str("that game has already started"),
+            RoomError::AlreadyStarted => {
+                f.write_str("that game has already started and no seat is free")
+            }
             RoomError::NotStarted => f.write_str("the game has not started yet"),
             RoomError::NotYourTurn => f.write_str("it is not your turn"),
             RoomError::Rule(e) => write!(f, "{e}"),
@@ -165,8 +187,12 @@ impl fmt::Display for RoomError {
 pub enum Leave {
     /// Before the start: the seat is open again.
     Vacated,
-    /// During play: the player resigned.
+    /// During play (or with reconnecting off, or after the game ended): the
+    /// player resigned.
     Resigned,
+    /// During play: the seat is held. Call `expire` with this ticket once
+    /// `reconnect_secs` have passed.
+    Away { ticket: u64 },
 }
 
 #[derive(Debug)]
@@ -174,6 +200,10 @@ pub struct Room {
     pub settings: MatchSettings,
     pub seats: Vec<Option<String>>,
     pub game: Option<Game>,
+    /// Per seat: the ticket of a pending reconnect timer while its player is away.
+    away: Vec<Option<u64>>,
+    /// Every `Applied`/`Resigned` since the start, replayed to rejoining players.
+    pub history: Vec<ServerMsg>,
 }
 
 impl Room {
@@ -182,7 +212,17 @@ impl Room {
             settings,
             seats: vec![None; settings.players],
             game: None,
+            away: vec![None; settings.players],
+            history: Vec::new(),
         }
+    }
+
+    pub fn is_away(&self, slot: usize) -> bool {
+        self.away.get(slot).is_some_and(Option::is_some)
+    }
+
+    pub fn any_away(&self) -> bool {
+        self.away.iter().any(Option::is_some)
     }
 
     pub fn started(&self) -> bool {
@@ -193,10 +233,18 @@ impl Room {
         self.seats.iter().all(Option::is_some)
     }
 
-    /// Seat a player; returns their slot.
+    /// Seat a player; returns their slot. Once started, only a held seat can
+    /// be taken: the away seat with this name, else the first away seat.
     pub fn join(&mut self, name: &str) -> Result<usize, RoomError> {
         if self.started() {
-            return Err(RoomError::AlreadyStarted);
+            let name = name.trim();
+            let slot = (0..self.seats.len())
+                .filter(|&i| self.is_away(i))
+                .find(|&i| self.seats[i].as_deref() == Some(name))
+                .or_else(|| (0..self.seats.len()).find(|&i| self.is_away(i)))
+                .ok_or(RoomError::AlreadyStarted)?;
+            self.away[slot] = None;
+            return Ok(slot);
         }
         let slot = self
             .seats
@@ -225,16 +273,41 @@ impl Room {
         if game.current != slot {
             return Err(RoomError::NotYourTurn);
         }
-        game.apply(action).map_err(RoomError::Rule)
+        let outcome = game.apply(action).map_err(RoomError::Rule)?;
+        self.history.push(ServerMsg::Applied { slot, action });
+        Ok(outcome)
     }
 
     pub fn leave(&mut self, slot: usize) -> Leave {
+        let Some(game) = self.game.as_ref() else {
+            self.seats[slot] = None;
+            return Leave::Vacated;
+        };
+        if game.result.is_none() && self.settings.reconnect_secs > 0 {
+            let ticket = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+            self.away[slot] = Some(ticket);
+            Leave::Away { ticket }
+        } else {
+            self.resign(slot);
+            Leave::Resigned
+        }
+    }
+
+    /// The reconnect time for `slot` ran out. Resigns them and returns true
+    /// unless they came back (or left again, with a newer ticket) meanwhile.
+    pub fn expire(&mut self, slot: usize, ticket: u64) -> bool {
+        if self.away.get(slot).copied().flatten() != Some(ticket) {
+            return false;
+        }
+        self.away[slot] = None;
+        self.resign(slot);
+        true
+    }
+
+    fn resign(&mut self, slot: usize) {
         if let Some(game) = self.game.as_mut() {
             game.resign(slot);
-            Leave::Resigned
-        } else {
-            self.seats[slot] = None;
-            Leave::Vacated
+            self.history.push(ServerMsg::Resigned { slot });
         }
     }
 }
@@ -406,6 +479,7 @@ mod tests {
             height: 8,
             players,
             seed: 11,
+            reconnect_secs: 60,
         }
     }
 
@@ -449,6 +523,11 @@ mod tests {
             ..settings(2)
         };
         assert!(huge.validate().is_err());
+        let slow = MatchSettings {
+            reconnect_secs: crate::MAX_RECONNECT_SECS + 1,
+            ..settings(2)
+        };
+        assert!(slow.validate().is_err());
     }
 
     #[test]
@@ -500,16 +579,88 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn leaving_during_play_resigns() {
-        let mut room = Room::new(settings(2));
-        room.join("ann").unwrap();
-        room.join("bob").unwrap();
+    fn started_room(players: usize, reconnect_secs: u32) -> Room {
+        let mut room = Room::new(MatchSettings {
+            reconnect_secs,
+            ..settings(players)
+        });
+        for name in ["ann", "bob", "cy"].iter().take(players) {
+            room.join(name).unwrap();
+        }
         room.start();
+        room
+    }
+
+    #[test]
+    fn leaving_during_play_without_reconnect_resigns() {
+        let mut room = started_room(2, 0);
         assert_eq!(room.leave(1), Leave::Resigned);
         let g = room.game.as_ref().unwrap();
         assert!(!g.players[1].alive);
         assert!(g.result.is_some());
+        assert_eq!(room.history, vec![ServerMsg::Resigned { slot: 1 }]);
+    }
+
+    #[test]
+    fn dropped_player_is_held_then_resigns_when_time_runs_out() {
+        let mut room = started_room(2, 60);
+        let Leave::Away { ticket } = room.leave(1) else {
+            panic!()
+        };
+        assert!(room.is_away(1));
+        assert!(room.game.as_ref().unwrap().players[1].alive);
+        assert!(room.expire(1, ticket));
+        assert!(!room.is_away(1));
+        assert!(!room.game.as_ref().unwrap().players[1].alive);
+        assert!(!room.expire(1, ticket), "only once");
+    }
+
+    #[test]
+    fn rejoin_takes_held_seat_and_cancels_timer() {
+        let mut room = started_room(3, 60);
+        room.act(0, Action::Pass).unwrap();
+        let Leave::Away { ticket: t0 } = room.leave(0) else {
+            panic!()
+        };
+        let Leave::Away { .. } = room.leave(2) else {
+            panic!()
+        };
+        // Name match wins over seat order; an unknown name gets the first held seat.
+        assert_eq!(room.join("cy"), Ok(2));
+        assert_eq!(room.join("someone"), Ok(0));
+        assert_eq!(room.join("late"), Err(RoomError::AlreadyStarted));
+        assert!(!room.expire(0, t0), "came back in time");
+        assert!(room.game.as_ref().unwrap().players[0].alive);
+        assert_eq!(
+            room.history,
+            vec![ServerMsg::Applied {
+                slot: 0,
+                action: Action::Pass
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_ticket_does_not_resign_after_second_drop() {
+        let mut room = started_room(2, 60);
+        let Leave::Away { ticket: first } = room.leave(1) else {
+            panic!()
+        };
+        room.join("bob").unwrap();
+        let Leave::Away { ticket: second } = room.leave(1) else {
+            panic!()
+        };
+        assert!(!room.expire(1, first));
+        assert!(room.is_away(1));
+        assert!(room.expire(1, second));
+    }
+
+    #[test]
+    fn leaving_after_game_over_does_not_hold_seat() {
+        let mut room = started_room(2, 60);
+        room.game.as_mut().unwrap().resign(1);
+        assert_eq!(room.leave(0), Leave::Resigned);
+        assert!(!room.any_away());
     }
 
     #[test]

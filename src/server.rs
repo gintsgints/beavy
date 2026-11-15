@@ -9,6 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// Where a connected player sits.
 #[derive(Clone)]
@@ -53,6 +54,7 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Server> {
 }
 
 fn handle_connection(stream: TcpStream, shared: &Shared) {
+    // `shared` is cloned into the reconnect timer, hence the borrowed Arc.
     let who = stream
         .peer_addr()
         .map_or_else(|_| "?".to_string(), |a| a.to_string());
@@ -84,7 +86,15 @@ fn handle_connection(stream: TcpStream, shared: &Shared) {
         }
     }
     if let Some(seat) = seat {
-        lock(shared).leave(&seat);
+        let held = lock(shared).leave(&seat);
+        // Seat held: resign the player unless they are back in time.
+        if let Some((ticket, secs)) = held {
+            let shared = Arc::clone(shared);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(u64::from(secs)));
+                lock(&shared).expire(&seat, ticket);
+            });
+        }
     }
     println!("{who} disconnected");
 }
@@ -147,7 +157,18 @@ impl Server {
             settings,
         });
         self.broadcast_roster(&s.code);
-        let full = self.lobby.room(&s.code).is_some_and(Room::is_full);
+        if room.started() {
+            // Rejoin: start the client, then replay the match so far.
+            let _ = tx.send(ServerMsg::Started);
+            for msg in &room.history {
+                let _ = tx.send(msg.clone());
+            }
+            self.broadcast(&s.code, &ServerMsg::Back { slot: s.slot });
+            println!("room {}: seat {} reconnected", s.code, s.slot);
+            *seat = Some(s);
+            return;
+        }
+        let full = room.is_full();
         if full {
             if let Some(room) = self.lobby.room_mut(&s.code) {
                 room.start();
@@ -174,26 +195,57 @@ impl Server {
         Ok(())
     }
 
-    fn leave(&mut self, s: &Seat) {
-        let Some(room) = self.lobby.room_mut(&s.code) else {
-            return;
-        };
+    /// The connection behind `s` closed. Returns the timer ticket and length
+    /// when the seat is held for a reconnect.
+    fn leave(&mut self, s: &Seat) -> Option<(u64, u32)> {
+        let room = self.lobby.room_mut(&s.code)?;
         let how = room.leave(s.slot);
+        let secs = room.settings.reconnect_secs;
         if let Some(slots) = self.conns.get_mut(&s.code) {
             slots[s.slot] = None;
         }
-        match how {
-            Leave::Vacated => self.broadcast_roster(&s.code),
-            Leave::Resigned => self.broadcast(&s.code, &ServerMsg::Resigned { slot: s.slot }),
+        let held = match how {
+            Leave::Vacated => {
+                self.broadcast_roster(&s.code);
+                None
+            }
+            Leave::Resigned => {
+                self.broadcast(&s.code, &ServerMsg::Resigned { slot: s.slot });
+                None
+            }
+            Leave::Away { ticket } => {
+                self.broadcast(&s.code, &ServerMsg::Away { slot: s.slot, secs });
+                println!("room {}: seat {} away, held {secs}s", s.code, s.slot);
+                Some((ticket, secs))
+            }
+        };
+        self.close_if_empty(&s.code);
+        held
+    }
+
+    /// Reconnect time for `s` ran out.
+    fn expire(&mut self, s: &Seat, ticket: u64) {
+        let Some(room) = self.lobby.room_mut(&s.code) else {
+            return;
+        };
+        if room.expire(s.slot, ticket) {
+            self.broadcast(&s.code, &ServerMsg::Resigned { slot: s.slot });
+            println!("room {}: seat {} did not return", s.code, s.slot);
         }
-        let nobody_left = self
+        self.close_if_empty(&s.code);
+    }
+
+    /// Drop the room once nobody is connected and no seat is held.
+    fn close_if_empty(&mut self, code: &str) {
+        let nobody_connected = self
             .conns
-            .get(&s.code)
+            .get(code)
             .is_some_and(|slots| slots.iter().all(Option::is_none));
-        if nobody_left {
-            self.lobby.remove(&s.code);
-            self.conns.remove(&s.code);
-            println!("room {} closed", s.code);
+        let someone_held = self.lobby.room(code).is_some_and(Room::any_away);
+        if nobody_connected && !someone_held {
+            self.lobby.remove(code);
+            self.conns.remove(code);
+            println!("room {code} closed");
         }
     }
 

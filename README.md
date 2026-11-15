@@ -26,8 +26,12 @@ cargo run --release -- --serve 0.0.0.0:7777
 Each player runs the client, picks **Host** or **Join** in the menu, types the server
 address and a name, and types a room code: the host picks it (1-8 letters or digits,
 refused if already in use) and tells the others, who enter the same code to join. The match starts when every seat is taken. Only the current player
-can act; the server validates every move and relays it to the others. A player who
-disconnects resigns.
+can act; the server validates every move and relays it to the others.
+
+If a player drops mid-game, their seat is held for the host's **Reconnect time** (menu, or
+`--reconnect SECS`; default 60 s, 0 = off, max 600 s). Play waits meanwhile. To come back,
+press Enter in the game window, or Join the same room code again with the same name; the
+server replays the match so far. If the time runs out, the player resigns.
 
 Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connect immediately.
 
@@ -52,7 +56,8 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
   the game and can retake it the same way.
 - A player is eliminated only when they have no units (tanks or settlers) and hold no base.
   With a base left they stay in and can produce again; losing that base while unitless ends them.
-- A player who disconnects resigns; bases they held turn grey (neutral) and anyone can capture them.
+- A player who resigns (or does not reconnect in time) is out; bases they held turn grey
+  (neutral) and anyone can capture them.
 - Last player alive wins. If the last players knock each other out at once, the game is a draw.
 - The end screen offers Play again (same settings, Enter) or Menu (M).
 
