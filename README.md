@@ -24,12 +24,12 @@ cargo run --release -- --serve 0.0.0.0:7777
 ```
 
 Each player runs the client, picks **Host** or **Join** in the menu, types the server
-address and a name, and either opens a room (a 4-letter code is shown while waiting)
-or enters a code. The match starts when every seat is taken. Only the current player
+address and a name, and types a room code: the host picks it (1-8 letters or digits,
+refused if already in use) and tells the others, who enter the same code to join. The match starts when every seat is taken. Only the current player
 can act; the server validates every move and relays it to the others. A player who
 disconnects resigns.
 
-Shortcuts: `--connect HOST:PORT --name NAME --host` or `--join CODE` connect immediately.
+Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connect immediately.
 
 ## Rules
 

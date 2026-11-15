@@ -29,11 +29,8 @@ type Shared = Arc<Mutex<Server>>;
 pub fn run(addr: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("beavy server listening on {addr}");
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()));
     let shared: Shared = Arc::new(Mutex::new(Server {
-        lobby: Lobby::new(seed),
+        lobby: Lobby::default(),
         conns: HashMap::new(),
     }));
     for stream in listener.incoming() {
@@ -95,15 +92,23 @@ fn handle_connection(stream: TcpStream, shared: &Shared) {
 impl Server {
     fn handle(&mut self, seat: &mut Option<Seat>, msg: ClientMsg, tx: &Sender<ServerMsg>) {
         let result = match msg {
-            ClientMsg::Create { name, settings } => {
+            ClientMsg::Create {
+                code,
+                name,
+                settings,
+            } => {
                 if seat.is_some() {
                     Err("you are already in a room".to_string())
                 } else {
-                    settings.validate().map(|()| {
-                        let (code, slot) = self.lobby.create(settings, &name);
+                    settings.validate().and_then(|()| {
+                        let (code, slot) = self
+                            .lobby
+                            .create(&code, settings, &name)
+                            .map_err(|e| e.to_string())?;
                         self.conns
                             .insert(code.clone(), vec![None; settings.players]);
                         self.sit(seat, Seat { code, slot }, tx);
+                        Ok(())
                     })
                 }
             }
@@ -111,11 +116,10 @@ impl Server {
                 if seat.is_some() {
                     Err("you are already in a room".to_string())
                 } else {
-                    let code = code.trim().to_ascii_uppercase();
                     self.lobby
                         .join(&code, &name)
                         .map_err(|e| e.to_string())
-                        .map(|slot| self.sit(seat, Seat { code, slot }, tx))
+                        .map(|(code, slot)| self.sit(seat, Seat { code, slot }, tx))
                 }
             }
             ClientMsg::Act(action) => seat

@@ -36,7 +36,7 @@ const MAX_H: i32 = 30;
 enum Mode {
     /// Everyone at one keyboard.
     Local,
-    /// Open a room on the server and wait for the others.
+    /// Open a room under a code of the host's choosing and wait for the others.
     Host,
     /// Enter a room code someone else is hosting.
     Join,
@@ -53,7 +53,7 @@ struct Settings {
     addr: String,
     /// Name shown to other players online.
     name: String,
-    /// Room code for Join.
+    /// Room code: chosen by the host, typed by joiners.
     code: String,
     /// `--host` / `--join` on the command line: connect without waiting for Enter.
     autostart: bool,
@@ -106,11 +106,10 @@ fn parse_args() -> Launch {
             ("--serve", Some(v)) => return Launch::Serve(v.clone()),
             ("--connect" | "-c", Some(v)) => cfg.addr.clone_from(v),
             ("--name" | "-n", Some(v)) => cfg.name.clone_from(v),
-            ("--host", _) => {
+            ("--host", Some(v)) => {
                 cfg.mode = Mode::Host;
+                cfg.code = v.to_ascii_uppercase();
                 cfg.autostart = true;
-                i += 1;
-                continue;
             }
             ("--join" | "-j", Some(v)) => {
                 cfg.mode = Mode::Join;
@@ -120,7 +119,7 @@ fn parse_args() -> Launch {
             ("--help", _) => {
                 println!(
                     "usage: beavy [--players N] [--width N] [--height N] [--seed N]\n\
-                     \x20      [--connect HOST:PORT] [--name NAME] [--host | --join CODE]\n\
+                     \x20      [--connect HOST:PORT] [--name NAME] [--host CODE | --join CODE]\n\
                      \x20      beavy --serve HOST:PORT   (run a game server)"
                 );
                 std::process::exit(0);
@@ -253,7 +252,7 @@ impl TextKind {
         match self {
             TextKind::Addr => 48,
             TextKind::Name => net::MAX_NAME_LEN,
-            TextKind::Code => net::CODE_LEN,
+            TextKind::Code => net::MAX_CODE_LEN,
         }
     }
 }
@@ -551,7 +550,7 @@ fn build_menu(
             root.spawn((
                 Text::new(
                     "Arrows: board size | +/-: players | S: reroll seed | click a text field to type\n\
-                     Online: one machine runs `beavy --serve 0.0.0.0:7777`; host opens a room, others join by code",
+                     Online: one machine runs `beavy --serve 0.0.0.0:7777`; host picks a room code, others join with it",
                 ),
                 font(14.0),
                 TextColor(Color::srgb(0.55, 0.55, 0.6)),
@@ -705,8 +704,12 @@ fn begin_match(
         next.set(AppState::Playing);
         return;
     }
-    if settings.mode == Mode::Join && settings.code.trim().is_empty() {
-        status.0 = "Enter the room code to join.".into();
+    if settings.code.trim().is_empty() {
+        status.0 = match settings.mode {
+            Mode::Host => "Choose a room code for the others to join with.",
+            _ => "Enter the room code to join.",
+        }
+        .into();
         return;
     }
     let client = match Client::connect(settings.addr.trim()) {
@@ -719,6 +722,7 @@ fn begin_match(
     let name = settings.name.clone();
     client.send(match settings.mode {
         Mode::Host => ClientMsg::Create {
+            code: settings.code.trim().to_ascii_uppercase(),
             name,
             settings: settings.match_settings(),
         },
@@ -872,7 +876,11 @@ fn menu_typing(
                 } else {
                     text.to_string()
                 };
-                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .filter(|c| kind != TextKind::Code || c.is_ascii_alphanumeric())
+                    .collect();
                 push_capped(field, &clean, max);
             }
             _ => {}

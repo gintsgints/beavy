@@ -6,7 +6,7 @@
 //! broadcasts accepted `Action`s. Every client rebuilds the same board from the
 //! shared seed and replays the actions, so board state never crosses the wire.
 
-use crate::game::{Action, ActionError, Game, Outcome, Rng};
+use crate::game::{Action, ActionError, Game, Outcome};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 pub const MAX_NAME_LEN: usize = 16;
-pub const CODE_LEN: usize = 4;
+pub const MAX_CODE_LEN: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------------------
@@ -61,8 +61,9 @@ impl MatchSettings {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ClientMsg {
-    /// Open a room and take seat 0.
+    /// Open a room under the host's chosen `code` and take seat 0.
     Create {
+        code: String,
         name: String,
         settings: MatchSettings,
     },
@@ -105,6 +106,19 @@ pub fn parse_msg<T: DeserializeOwned>(line: &str) -> Result<T, String> {
     serde_json::from_str(line).map_err(|e| format!("bad message: {e}"))
 }
 
+/// Normalize a host- or joiner-typed room code: trimmed, upper case,
+/// 1..=`MAX_CODE_LEN` ASCII letters or digits.
+pub fn clean_code(raw: &str) -> Result<String, RoomError> {
+    let code = raw.trim().to_ascii_uppercase();
+    let ok =
+        (1..=MAX_CODE_LEN).contains(&code.len()) && code.chars().all(|c| c.is_ascii_alphanumeric());
+    if ok {
+        Ok(code)
+    } else {
+        Err(RoomError::BadCode)
+    }
+}
+
 /// Trim, cap and default a player name so the roster stays readable.
 pub fn clean_name(raw: &str, slot: usize) -> String {
     let name: String = raw.trim().chars().take(MAX_NAME_LEN).collect();
@@ -121,6 +135,8 @@ pub fn clean_name(raw: &str, slot: usize) -> String {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RoomError {
+    BadCode,
+    CodeTaken,
     NoSuchRoom,
     Full,
     AlreadyStarted,
@@ -132,6 +148,8 @@ pub enum RoomError {
 impl fmt::Display for RoomError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RoomError::BadCode => write!(f, "room code must be 1-{MAX_CODE_LEN} letters or digits"),
+            RoomError::CodeTaken => f.write_str("that room code is already in use"),
             RoomError::NoSuchRoom => f.write_str("no room with that code"),
             RoomError::Full => f.write_str("that room is full"),
             RoomError::AlreadyStarted => f.write_str("that game has already started"),
@@ -222,45 +240,36 @@ impl Room {
 }
 
 /// All open rooms, keyed by their join code.
+#[derive(Default)]
 pub struct Lobby {
     rooms: HashMap<String, Room>,
-    rng: Rng,
 }
 
 impl Lobby {
-    pub fn new(seed: u64) -> Lobby {
-        Lobby {
-            rooms: HashMap::new(),
-            rng: Rng::new(seed),
+    /// Open a room under the host's `code` with the creator in seat 0.
+    /// Returns the normalized code and seat.
+    pub fn create(
+        &mut self,
+        code: &str,
+        settings: MatchSettings,
+        name: &str,
+    ) -> Result<(String, usize), RoomError> {
+        let code = clean_code(code)?;
+        if self.rooms.contains_key(&code) {
+            return Err(RoomError::CodeTaken);
         }
-    }
-
-    fn fresh_code(&mut self) -> String {
-        loop {
-            let code: String = (0..CODE_LEN)
-                .map(|_| {
-                    let n = u8::try_from(self.rng.below(26)).expect("0..26 fits u8");
-                    char::from(b'A' + n)
-                })
-                .collect();
-            if !self.rooms.contains_key(&code) {
-                return code;
-            }
-        }
-    }
-
-    /// Open a room with the creator in seat 0. Returns the code and seat.
-    pub fn create(&mut self, settings: MatchSettings, name: &str) -> (String, usize) {
-        let code = self.fresh_code();
         let mut room = Room::new(settings);
         let slot = room.join(name).expect("fresh room has a free seat");
         self.rooms.insert(code.clone(), room);
-        (code, slot)
+        Ok((code, slot))
     }
 
-    pub fn join(&mut self, code: &str, name: &str) -> Result<usize, RoomError> {
-        let room = self.rooms.get_mut(code).ok_or(RoomError::NoSuchRoom)?;
-        room.join(name)
+    /// Take a seat in the room under `code`. Returns the normalized code and seat.
+    pub fn join(&mut self, code: &str, name: &str) -> Result<(String, usize), RoomError> {
+        let code = clean_code(code).map_err(|_| RoomError::NoSuchRoom)?;
+        let room = self.rooms.get_mut(&code).ok_or(RoomError::NoSuchRoom)?;
+        let slot = room.join(name)?;
+        Ok((code, slot))
     }
 
     pub fn room(&self, code: &str) -> Option<&Room> {
@@ -496,16 +505,29 @@ mod tests {
     }
 
     #[test]
-    fn lobby_hands_out_unique_codes() {
-        let mut lobby = Lobby::new(1);
-        let (a, slot_a) = lobby.create(settings(2), "a");
-        let (b, _) = lobby.create(settings(2), "b");
-        assert_ne!(a, b);
-        assert_eq!(a.len(), CODE_LEN);
-        assert_eq!(slot_a, 0);
-        assert_eq!(lobby.join(&a, "c"), Ok(1));
+    fn lobby_uses_host_chosen_code() {
+        let mut lobby = Lobby::default();
+        assert_eq!(
+            lobby.create(" tank1 ", settings(2), "a"),
+            Ok(("TANK1".to_string(), 0))
+        );
+        assert_eq!(
+            lobby.create("Tank1", settings(2), "b"),
+            Err(RoomError::CodeTaken)
+        );
+        assert_eq!(lobby.join("tank1", "c"), Ok(("TANK1".to_string(), 1)));
         assert_eq!(lobby.join("ZZZZ", "c"), Err(RoomError::NoSuchRoom));
-        lobby.remove(&a);
-        assert!(lobby.room(&a).is_none());
+        lobby.remove("TANK1");
+        assert!(lobby.room("TANK1").is_none());
+    }
+
+    #[test]
+    fn room_codes_are_validated() {
+        assert_eq!(clean_code("ab12"), Ok("AB12".to_string()));
+        assert_eq!(clean_code("   "), Err(RoomError::BadCode));
+        assert_eq!(clean_code("a-b"), Err(RoomError::BadCode));
+        assert_eq!(clean_code("ABCDEFGHI"), Err(RoomError::BadCode));
+        let mut lobby = Lobby::default();
+        assert_eq!(lobby.create("", settings(2), "a"), Err(RoomError::BadCode));
     }
 }
