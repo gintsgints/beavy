@@ -1497,8 +1497,10 @@ fn spawn_tank(commands: &mut Commands, assets: &TankAssets, u: &game::Unit) {
 }
 
 /// Pulse the hull of the selected tank so the active player sees which tank
-/// their keys will drive.
+/// their keys will drive. Online, a window off-turn keeps its selection but
+/// stops pulsing, so only the player to act has a blinking tank.
 fn pulse_selected(
+    game: Res<GameRes>,
     selected: Res<Selected>,
     time: Res<Time>,
     mut hulls: Query<(&Hull, &mut Sprite)>,
@@ -1506,7 +1508,7 @@ fn pulse_selected(
     let phase = (time.elapsed_secs() * 6.0).sin() * 0.5 + 0.5;
     for (hull, mut sprite) in &mut hulls {
         let base = player_color(hull.owner);
-        sprite.color = if Some(hull.unit) == selected.0 {
+        sprite.color = if Some(hull.unit) == selected.0 && hull.owner == game.0.current {
             base.mix(&Color::WHITE, 0.7 * phase)
         } else {
             base
