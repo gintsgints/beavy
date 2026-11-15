@@ -1249,23 +1249,45 @@ fn acting_player(g: &Game, net: Option<&Net>) -> usize {
     net.and_then(|n| n.slot).unwrap_or(g.current)
 }
 
-/// First tank of `owner`, used as the default selection.
-fn first_unit_of(g: &Game, owner: usize) -> Option<u32> {
-    g.units.iter().find(|u| u.owner == owner).map(|u| u.id)
+/// Units of `owner` that can still act this turn, or all of them once every
+/// unit has acted.
+fn selectable_units(g: &Game, owner: usize) -> Vec<u32> {
+    let own = || g.units.iter().filter(move |u| u.owner == owner);
+    let ready: Vec<u32> = own().filter(|u| !u.acted).map(|u| u.id).collect();
+    if ready.is_empty() {
+        own().map(|u| u.id).collect()
+    } else {
+        ready
+    }
 }
 
-/// Next tank of `owner` after `current` in unit order, wrapping around.
+/// First unit of `owner` that can still act, used as the default selection.
+fn first_unit_of(g: &Game, owner: usize) -> Option<u32> {
+    selectable_units(g, owner).first().copied()
+}
+
+/// Next ready unit of `owner` after `current` in unit order, wrapping around.
 fn next_unit_of(g: &Game, owner: usize, current: Option<u32>) -> Option<u32> {
-    let own: Vec<u32> = g
-        .units
-        .iter()
-        .filter(|u| u.owner == owner)
-        .map(|u| u.id)
-        .collect();
+    let own = selectable_units(g, owner);
     let idx = current
         .and_then(|id| own.iter().position(|&x| x == id))
         .map_or(0, |i| (i + 1) % own.len().max(1));
     own.get(idx).copied()
+}
+
+/// Move the selection on to a ready unit of `owner` once the selected one is
+/// gone, spent, or not theirs.
+fn advance_selection(g: &Game, owner: usize, selected: &mut Selected) {
+    let spent = selected
+        .0
+        .and_then(|id| g.unit(id))
+        .is_none_or(|u| u.acted || u.owner != owner);
+    if spent {
+        let fresh = first_unit_of(g, owner);
+        if selected.0 != fresh {
+            selected.0 = fresh;
+        }
+    }
 }
 
 fn handle_input(
@@ -1380,10 +1402,7 @@ fn handle_input(
         return;
     }
     match game.0.apply(action) {
-        Ok(_) => {
-            // Turn passed to the next_state player; preselect one of their tanks.
-            selected.0 = first_unit_of(&game.0, game.0.current);
-        }
+        Ok(_) => advance_selection(&game.0, game.0.current, &mut selected),
         Err(e) => game.0.log.push(format!("Not allowed: {e}.")),
     }
 }
@@ -1464,14 +1483,9 @@ fn net_poll_playing(
             }
         }
     }
-    // Keep a valid selection: our first tank if the old one is gone.
+    // Keep a valid selection: our next ready unit if the old one is gone or spent.
     let me = acting_player(&game.0, Some(&net));
-    if selected.0.and_then(|id| game.0.unit(id)).is_none() {
-        let fresh = first_unit_of(&game.0, me);
-        if selected.0 != fresh {
-            selected.0 = fresh;
-        }
-    }
+    advance_selection(&game.0, me, &mut selected);
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,7 +1641,8 @@ fn spawn_settler(commands: &mut Commands, u: &game::Unit) {
 
 /// Pulse the hull of the selected tank so the active player sees which tank
 /// their keys will drive. Online, a window off-turn keeps its selection but
-/// stops pulsing, so only the player to act has a blinking tank.
+/// stops pulsing, so only the player to act has a blinking tank. Units of the
+/// player to act that are spent this turn are dimmed.
 fn pulse_selected(
     game: Res<GameRes>,
     selected: Res<Selected>,
@@ -1637,7 +1652,11 @@ fn pulse_selected(
     let phase = (time.elapsed_secs() * 6.0).sin() * 0.5 + 0.5;
     for (hull, mut sprite) in &mut hulls {
         let base = player_color(hull.owner);
-        sprite.color = if Some(hull.unit) == selected.0 && hull.owner == game.0.current {
+        let to_act = hull.owner == game.0.current;
+        let spent = to_act && game.0.unit(hull.unit).is_some_and(|u| u.acted);
+        sprite.color = if spent {
+            base.mix(&Color::BLACK, 0.55)
+        } else if Some(hull.unit) == selected.0 && to_act {
             base.mix(&Color::WHITE, 0.7 * phase)
         } else {
             base
@@ -1853,6 +1872,17 @@ fn sync_hud(
             cur.name,
             color_name(g.current)
         );
+        let units = g
+            .units
+            .iter()
+            .filter(|u| u.owner == g.current && !u.acted)
+            .count();
+        let bases = g
+            .bases
+            .iter()
+            .filter(|b| b.holder == Some(g.current) && !b.acted)
+            .count();
+        let _ = write!(s, "  |  Ready: {units} units, {bases} bases");
         if let Some(net) = &net {
             let me = acting_player(g, Some(net));
             let _ = write!(s, "  |  Room {}  |  You: {}", net.code, color_name(me));
@@ -1885,18 +1915,19 @@ fn sync_hud(
     if let Some(u) = selected.0.and_then(|id| g.unit(id)) {
         let _ = writeln!(
             s,
-            "Selected: {} #{} at ({}, {}) strength {}",
+            "Selected: {} #{} at ({}, {}) strength {}{}",
             u.kind.name(),
             u.id,
             u.pos.x,
             u.pos.y,
-            u.strength
+            u.strength,
+            if u.acted { " (done this turn)" } else { "" }
         );
     } else if g.result.is_none() {
         s.push_str("Selected: none (click one of your units or press Tab)\n");
     }
 
-    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise | F found base | Space pass | M menu\n");
+    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise | F found base | Space end turn | M menu\n");
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }

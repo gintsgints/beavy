@@ -84,6 +84,8 @@ pub struct Unit {
     pub strength: u32,
     /// Direction of the last move; purely cosmetic.
     pub facing: Dir,
+    /// Already moved, raised or founded this turn. Cleared when a turn starts.
+    pub acted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,9 +102,12 @@ pub struct Base {
     /// Who may produce here. Changes when another player's tank ends a move
     /// on it; `None` once the holder is out.
     pub holder: Option<usize>,
+    /// Already produced this turn. Cleared when a turn starts.
+    pub acted: bool,
 }
 
-/// What a player may do on their turn. Exactly one action ends the turn.
+/// What a player may do on their turn: each unit acts once (move, raise or
+/// found), each held base produces once, then `Pass` ends the turn.
 /// This is the only rules type that crosses the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -123,6 +128,7 @@ pub enum Action {
     Found {
         unit: u32,
     },
+    /// End the turn.
     Pass,
 }
 
@@ -141,6 +147,8 @@ pub enum ActionError {
     CannotRaiseSettler,
     NotASettler,
     TooCloseToBase,
+    UnitAlreadyActed,
+    BaseAlreadyActed,
 }
 
 impl std::fmt::Display for ActionError {
@@ -159,6 +167,8 @@ impl std::fmt::Display for ActionError {
             ActionError::CannotRaiseSettler => "settlers cannot be raised",
             ActionError::NotASettler => "only settlers can found a base",
             ActionError::TooCloseToBase => "too close to a base: keep two free tiles between bases",
+            ActionError::UnitAlreadyActed => "that unit has already acted this turn",
+            ActionError::BaseAlreadyActed => "that base has already produced this turn",
         };
         f.write_str(s)
     }
@@ -282,6 +292,7 @@ impl Game {
             .map(|(i, &pos)| Base {
                 pos,
                 holder: Some(i),
+                acted: false,
             })
             .collect::<Vec<_>>();
 
@@ -365,8 +376,9 @@ impl Game {
 
     // -- actions ------------------------------------------------------------
 
-    /// Apply the current player's action. On success the turn passes to the
-    /// next living player. On error nothing changes and it is still their turn.
+    /// Apply the current player's action. `Pass` hands the turn to the next
+    /// living player; anything else spends the acting unit or base. On error
+    /// nothing changes.
     pub fn apply(&mut self, action: Action) -> Result<Outcome, ActionError> {
         if self.result.is_some() {
             return Err(ActionError::GameOver);
@@ -389,14 +401,20 @@ impl Game {
         };
         self.log.push(self.describe(me, action, outcome, noun));
         self.check_victory();
-        self.advance_turn();
+        if action == Action::Pass {
+            self.advance_turn();
+        }
         Ok(outcome)
     }
 
+    /// A unit of `me` that has not acted yet this turn.
     fn own_unit(&self, me: usize, id: u32) -> Result<&Unit, ActionError> {
         let u = self.unit(id).ok_or(ActionError::NoSuchUnit)?;
         if u.owner != me {
             return Err(ActionError::NotYourUnit);
+        }
+        if u.acted {
+            return Err(ActionError::UnitAlreadyActed);
         }
         Ok(u)
     }
@@ -426,12 +444,14 @@ impl Game {
             pos,
             strength,
             facing: Dir::Right,
+            acted: false,
         });
         id
     }
 
     /// New unit on or next to the chosen held base, or the first held base
-    /// (home first) with a free cell. Tanks start at strength 1, settlers at 0.
+    /// (home first) that has not produced yet and has a free cell. Tanks start
+    /// at strength 1, settlers at 0. New units wait for the next turn.
     fn produce(
         &mut self,
         me: usize,
@@ -453,10 +473,21 @@ impl Game {
         if bases.is_empty() {
             return Err(ActionError::NoBase);
         }
-        let spot = bases
+        let ready: Vec<Pos> = bases
+            .into_iter()
+            .filter(|&p| self.base_at(p).is_some_and(|i| !self.bases[i].acted))
+            .collect();
+        if ready.is_empty() {
+            return Err(ActionError::BaseAlreadyActed);
+        }
+        let (base, spot) = ready
             .iter()
-            .flat_map(|&base| std::iter::once(base).chain(DIRS.iter().map(move |&d| base.step(d))))
-            .find(|&p| {
+            .flat_map(|&base| {
+                std::iter::once(base)
+                    .chain(DIRS.iter().map(move |&d| base.step(d)))
+                    .map(move |p| (base, p))
+            })
+            .find(|&(_, p)| {
                 self.in_bounds(p)
                     && self.terrain_at(p) == Terrain::Plain
                     && self.unit_at(p).is_none()
@@ -467,6 +498,10 @@ impl Game {
             UnitKind::Settler => 0,
         };
         let unit = self.spawn(kind, me, spot, strength);
+        self.unit_mut(unit).acted = true;
+        if let Some(i) = self.base_at(base) {
+            self.bases[i].acted = true;
+        }
         Ok(Outcome::Produced { unit, kind })
     }
 
@@ -476,6 +511,7 @@ impl Game {
         }
         let u = self.unit_mut(id);
         u.strength += 1;
+        u.acted = true;
         let strength = u.strength;
         Ok(Outcome::Raised { unit: id, strength })
     }
@@ -503,7 +539,9 @@ impl Game {
         {
             return Err(ActionError::SettlerThere);
         }
-        self.unit_mut(id).facing = dir;
+        let u = self.unit_mut(id);
+        u.facing = dir;
+        u.acted = true;
 
         let defender = self.unit_at(to).map(|u| (u.id, u.owner, u.strength));
         let outcome = match defender {
@@ -557,9 +595,11 @@ impl Game {
             return Err(ActionError::TooCloseToBase);
         }
         self.remove_unit(id);
+        // Founded this turn: it produces from the next one.
         self.bases.push(Base {
             pos,
             holder: Some(me),
+            acted: true,
         });
         Ok(Outcome::Founded {
             base: self.bases.len() - 1,
@@ -587,6 +627,8 @@ impl Game {
     fn capture(&mut self, base: usize, by: usize) {
         let from = self.bases[base].holder;
         self.bases[base].holder = Some(by);
+        // A freshly taken base produces from the captor's next turn.
+        self.bases[base].acted = true;
         let who = &self.players[by].name;
         let msg = match from {
             _ if base == by => format!("{who} took back their home base!"),
@@ -646,6 +688,12 @@ impl Game {
                     self.turn += 1;
                 }
                 self.current = idx;
+                for u in &mut self.units {
+                    u.acted = false;
+                }
+                for b in &mut self.bases {
+                    b.acted = false;
+                }
                 return;
             }
         }
@@ -654,7 +702,7 @@ impl Game {
     fn describe(&self, me: usize, action: Action, outcome: Outcome, noun: &str) -> String {
         let name = &self.players[me].name;
         match (action, outcome) {
-            (_, Outcome::Passed) => format!("{name} passed."),
+            (_, Outcome::Passed) => format!("{name} ended their turn."),
             (_, Outcome::Produced { unit, kind }) => {
                 format!("{name} produced {} #{unit}.", kind.name())
             }
@@ -837,7 +885,9 @@ mod tests {
         let a = g.unit(a).unwrap();
         assert_eq!(a.pos, Pos::new(3, 2));
         assert_eq!(a.strength, 3);
-        assert_eq!(g.current, 1, "turn passed to next player");
+        assert_eq!(g.current, 0, "moving does not end the turn");
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(g.current, 1, "passing hands the turn on");
     }
 
     #[test]
@@ -962,6 +1012,7 @@ mod tests {
             panic!()
         };
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
+        g.apply(Action::Pass).unwrap();
         g.apply(Action::Pass).unwrap(); // player 2
         let Outcome::Produced { unit, .. } = g
             .apply(Action::Produce {
@@ -1027,6 +1078,7 @@ mod tests {
         assert!(g.players[1].alive, "still has a tank");
         assert!(g.unit(far).is_some());
         assert!(g.result.is_none());
+        g.apply(Action::Pass).unwrap();
         assert_eq!(
             g.apply(Action::Produce {
                 kind: UnitKind::Tank,
@@ -1096,6 +1148,7 @@ mod tests {
         .unwrap();
         assert!(g.players[1].alive, "still holds home base");
         assert!(g.result.is_none());
+        g.apply(Action::Pass).unwrap();
         assert_eq!(g.current, 1);
         let Outcome::Produced { unit, .. } = g
             .apply(Action::Produce {
@@ -1149,6 +1202,7 @@ mod tests {
         assert_eq!(kind, UnitKind::Settler);
         assert_eq!(g.unit(unit).unwrap().strength, 0);
         g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
         assert_eq!(
             g.apply(Action::Raise { unit }),
             Err(ActionError::CannotRaiseSettler)
@@ -1162,6 +1216,7 @@ mod tests {
         g.bases.push(Base {
             pos: Pos::new(3, 0),
             holder: Some(0),
+            acted: false,
         });
         let Outcome::Produced { unit, .. } = g
             .apply(Action::Produce {
@@ -1173,6 +1228,7 @@ mod tests {
             panic!()
         };
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(3, 0));
+        g.apply(Action::Pass).unwrap();
         g.apply(Action::Pass).unwrap();
         assert_eq!(
             g.apply(Action::Produce {
@@ -1197,7 +1253,8 @@ mod tests {
             g.bases[2],
             Base {
                 pos: Pos::new(3, 0),
-                holder: Some(0)
+                holder: Some(0),
+                acted: true,
             }
         );
     }
@@ -1294,6 +1351,90 @@ mod tests {
         .unwrap();
         assert!(g.players[1].alive);
         assert!(g.result.is_none());
+    }
+
+    #[test]
+    fn each_unit_acts_once_per_turn() {
+        let mut g = arena();
+        let a = g.spawn_unit(0, Pos::new(2, 2), 1);
+        let b = g.spawn_unit(0, Pos::new(3, 3), 1);
+        g.spawn_unit(1, Pos::new(5, 0), 1);
+        let right = Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        };
+        g.apply(right).unwrap();
+        assert_eq!(g.apply(right), Err(ActionError::UnitAlreadyActed));
+        assert_eq!(
+            g.apply(Action::Raise { unit: a }),
+            Err(ActionError::UnitAlreadyActed)
+        );
+        g.apply(Action::Raise { unit: b }).unwrap();
+        assert_eq!(g.current, 0);
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        g.apply(right).unwrap();
+        assert_eq!(g.unit(a).unwrap().pos, Pos::new(4, 2));
+    }
+
+    #[test]
+    fn each_base_produces_once_per_turn_and_new_units_wait() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        g.bases.push(Base {
+            pos: Pos::new(3, 0),
+            holder: Some(0),
+            acted: false,
+        });
+        let tank = Action::Produce {
+            kind: UnitKind::Tank,
+            at: None,
+        };
+        let Outcome::Produced { unit, .. } = g.apply(tank).unwrap() else {
+            panic!()
+        };
+        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
+        assert_eq!(
+            g.apply(Action::Raise { unit }),
+            Err(ActionError::UnitAlreadyActed)
+        );
+        assert_eq!(
+            g.apply(Action::Produce {
+                kind: UnitKind::Tank,
+                at: Some(Pos::new(0, 0)),
+            }),
+            Err(ActionError::BaseAlreadyActed)
+        );
+        let Outcome::Produced { unit: second, .. } = g.apply(tank).unwrap() else {
+            panic!()
+        };
+        assert_eq!(g.unit(second).unwrap().pos, Pos::new(3, 0));
+        assert_eq!(g.apply(tank), Err(ActionError::BaseAlreadyActed));
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Raise { unit }).unwrap();
+        g.apply(tank).unwrap();
+    }
+
+    #[test]
+    fn captured_base_produces_from_next_turn() {
+        let mut g = arena();
+        g.bases[0].holder = None;
+        let a = g.spawn_unit(0, Pos::new(4, 5), 3);
+        g.spawn_unit(1, Pos::new(0, 5), 1);
+        g.apply(Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        let tank = Action::Produce {
+            kind: UnitKind::Tank,
+            at: None,
+        };
+        assert_eq!(g.apply(tank), Err(ActionError::BaseAlreadyActed));
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        assert!(g.apply(tank).is_ok());
     }
 
     #[test]

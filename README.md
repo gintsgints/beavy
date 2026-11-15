@@ -38,14 +38,15 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
 ## Rules
 
 - A map is generated (plains and impassable water) and every player gets a base with one tank.
-- Players act in order. One of your tanks is preselected and blinks; click another or press Tab to cycle. One action per turn:
+- Players act in order. One of your units that can still act is preselected and blinks; click another or press Tab to cycle. Each turn every unit acts once and every base you hold produces once:
   - **Move** a selected tank one cell (arrows / WASD).
   - **Produce** a tank of strength 1 (P) or a settler (E) at a base you hold. Hover a held
     base to produce there; otherwise your home base is tried first, then the others.
   - **Found** a base with the selected settler (F): the settler becomes a base on its tile.
     Every base needs two free tiles to every other base, diagonals included.
   - **Raise** a selected tank's strength by 1 (R). Settlers cannot be raised.
-  - Space passes. `M` returns to the menu.
+  - Space ends your turn. Spent units are dimmed; new units and bases you just captured or founded
+    wait for your next turn. `M` returns to the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
   Equal strength destroys both.
 - Settlers are peaceful, strength 0. A settler cannot enter a tile with another settler. A
