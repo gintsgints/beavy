@@ -179,8 +179,31 @@ enum AppState {
 #[derive(Resource)]
 struct GameRes(Game);
 
-#[derive(Resource, Default)]
-struct Selected(Option<u32>);
+/// What the player's keys act on, and the one thing that blinks: a unit
+/// (arrows, R, F) or a base that can still produce (P, E).
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum Selected {
+    #[default]
+    Nothing,
+    Unit(u32),
+    Base(Pos),
+}
+
+impl Selected {
+    fn unit(self) -> Option<u32> {
+        match self {
+            Selected::Unit(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn base(self) -> Option<Pos> {
+        match self {
+            Selected::Base(p) => Some(p),
+            _ => None,
+        }
+    }
+}
 
 /// Live server connection plus what it told us. Present only when online.
 #[derive(Resource)]
@@ -1150,7 +1173,7 @@ fn build_board(
             }
         }
     }
-    selected.0 = first_unit_of(&game, acting_player(&game, net.as_deref()));
+    *selected = first_ready(&game, acting_player(&game, net.as_deref()));
 
     let grid_w = grid_f32(game.width) * CELL;
     let grid_h = grid_f32(game.height) * CELL;
@@ -1271,48 +1294,77 @@ fn acting_player(g: &Game, net: Option<&Net>) -> usize {
     net.and_then(|n| n.slot).unwrap_or(g.current)
 }
 
-/// Units of `owner` that can still act this turn, or all of them once every
-/// unit has acted.
-fn selectable_units(g: &Game, owner: usize) -> Vec<u32> {
+/// What `owner` can still use this turn: ready units first, then bases that
+/// can produce. Once nothing is ready, all their units, so Tab still inspects.
+fn selectable(g: &Game, owner: usize) -> Vec<Selected> {
     let own = || g.units.iter().filter(move |u| u.owner == owner);
-    let ready: Vec<u32> = own().filter(|u| !u.acted).map(|u| u.id).collect();
+    let ready: Vec<Selected> = own()
+        .filter(|u| !u.acted)
+        .map(|u| Selected::Unit(u.id))
+        .chain(
+            g.held_bases(owner)
+                .filter(|&p| g.can_produce_at(owner, p))
+                .map(Selected::Base),
+        )
+        .collect();
     if ready.is_empty() {
-        own().map(|u| u.id).collect()
+        own().map(|u| Selected::Unit(u.id)).collect()
     } else {
         ready
     }
 }
 
-/// First unit of `owner` that can still act, used as the default selection.
-/// `None` once every unit has acted, so no spent unit looks selected.
-fn first_unit_of(g: &Game, owner: usize) -> Option<u32> {
-    g.units
+/// Whether `sel` is something `owner` can still use this turn.
+fn is_ready(g: &Game, owner: usize, sel: Selected) -> bool {
+    match sel {
+        Selected::Nothing => false,
+        Selected::Unit(id) => g.unit(id).is_some_and(|u| u.owner == owner && !u.acted),
+        Selected::Base(p) => g.can_produce_at(owner, p),
+    }
+}
+
+/// First ready unit or base of `owner`, used as the default selection.
+/// `Nothing` once everything is spent, so nothing spent looks selected.
+fn first_ready(g: &Game, owner: usize) -> Selected {
+    selectable(g, owner)
+        .into_iter()
+        .find(|&s| is_ready(g, owner, s))
+        .unwrap_or_default()
+}
+
+/// Next selectable unit or base of `owner` after `current`, wrapping around.
+fn next_selectable(g: &Game, owner: usize, current: Selected) -> Selected {
+    let all = selectable(g, owner);
+    let idx = all
         .iter()
-        .find(|u| u.owner == owner && !u.acted)
-        .map(|u| u.id)
+        .position(|&x| x == current)
+        .map_or(0, |i| (i + 1) % all.len().max(1));
+    all.get(idx).copied().unwrap_or_default()
 }
 
-/// Next ready unit of `owner` after `current` in unit order, wrapping around.
-fn next_unit_of(g: &Game, owner: usize, current: Option<u32>) -> Option<u32> {
-    let own = selectable_units(g, owner);
-    let idx = current
-        .and_then(|id| own.iter().position(|&x| x == id))
-        .map_or(0, |i| (i + 1) % own.len().max(1));
-    own.get(idx).copied()
-}
-
-/// Move the selection on to a ready unit of `owner` once the selected one is
-/// gone, spent, or not theirs.
+/// Move the selection on to the next ready unit or base of `owner` once the
+/// selected one is gone, spent, or not theirs.
 fn advance_selection(g: &Game, owner: usize, selected: &mut Selected) {
-    let spent = selected
-        .0
-        .and_then(|id| g.unit(id))
-        .is_none_or(|u| u.acted || u.owner != owner);
-    if spent {
-        let fresh = first_unit_of(g, owner);
-        if selected.0 != fresh {
-            selected.0 = fresh;
+    if !is_ready(g, owner, *selected) {
+        let fresh = first_ready(g, owner);
+        if *selected != fresh {
+            *selected = fresh;
         }
+    }
+}
+
+/// What a click on `cell` selects: one of our units, else one of our bases,
+/// else nothing.
+fn clicked(g: &Game, me: usize, cell: Option<Pos>) -> Selected {
+    let Some(p) = cell.filter(|&p| g.in_bounds(p)) else {
+        return Selected::Nothing;
+    };
+    if let Some(u) = g.unit_at(p).filter(|u| u.owner == me) {
+        Selected::Unit(u.id)
+    } else if g.base_at(p).is_some_and(|i| g.bases[i].holder == Some(me)) {
+        Selected::Base(p)
+    } else {
+        Selected::Nothing
     }
 }
 
@@ -1342,24 +1394,18 @@ fn handle_input(
     }
     let me = acting_player(&game.0, net.as_deref());
 
-    // Mouse: select one of our tanks, or deselect.
     if mouse.just_pressed(MouseButton::Left) {
-        let g: &Game = &game.0;
-        let picked = cursor_cell(&windows, &cameras)
-            .filter(|&p| g.in_bounds(p))
-            .and_then(|p| g.unit_at(p))
-            .filter(|u| u.owner == me)
-            .map(|u| u.id);
-        if selected.0 != picked {
-            selected.0 = picked;
+        let picked = clicked(&game.0, me, cursor_cell(&windows, &cameras));
+        if *selected != picked {
+            *selected = picked;
         }
     }
 
-    if keys.just_pressed(KeyCode::Escape) && selected.0.is_some() {
-        selected.0 = None;
+    if keys.just_pressed(KeyCode::Escape) && *selected != Selected::Nothing {
+        *selected = Selected::Nothing;
     }
     if keys.just_pressed(KeyCode::Tab) {
-        selected.0 = next_unit_of(&game.0, me, selected.0);
+        *selected = next_selectable(&game.0, me, *selected);
     }
 
     // Keyboard: pick exactly one action.
@@ -1376,7 +1422,7 @@ fn handle_input(
     };
 
     let action = if let Some(dir) = dir {
-        if let Some(unit) = selected.0 {
+        if let Some(unit) = selected.unit() {
             Some(Action::Move { unit, dir })
         } else {
             game.0
@@ -1390,20 +1436,23 @@ fn handle_input(
         } else {
             UnitKind::Settler
         };
-        // Produce at the held base under the cursor; otherwise let the rules pick.
+        // Produce at the selected base, else the held base under the cursor,
+        // else let the rules pick.
         let g: &Game = &game.0;
-        let at = cursor_cell(&windows, &cameras)
-            .filter(|&p| g.base_at(p).is_some_and(|i| g.bases[i].holder == Some(me)));
+        let at = selected.base().or_else(|| {
+            cursor_cell(&windows, &cameras)
+                .filter(|&p| g.base_at(p).is_some_and(|i| g.bases[i].holder == Some(me)))
+        });
         Some(Action::Produce { kind, at })
     } else if keys.just_pressed(KeyCode::KeyF) {
-        if let Some(unit) = selected.0 {
+        if let Some(unit) = selected.unit() {
             Some(Action::Found { unit })
         } else {
             game.0.log.push("Select a settler to found a base.".into());
             None
         }
     } else if keys.just_pressed(KeyCode::KeyR) {
-        if let Some(unit) = selected.0 {
+        if let Some(unit) = selected.unit() {
             Some(Action::Raise { unit })
         } else {
             game.0
@@ -1682,7 +1731,7 @@ fn pulse_selected(
         let spent = to_act && game.0.unit(hull.unit).is_some_and(|u| u.acted);
         sprite.color = if spent {
             base.mix(&Color::BLACK, 0.55)
-        } else if Some(hull.unit) == selected.0 && to_act {
+        } else if Some(hull.unit) == selected.unit() && to_act {
             base.mix(&Color::WHITE, 0.7 * phase)
         } else {
             base
@@ -1690,11 +1739,12 @@ fn pulse_selected(
     }
 }
 
-/// Blink the frame of every base the player to act can still produce at, so
-/// an unused base is as easy to spot as an unmoved unit. Online, only on our turn.
+/// Blink the frame of the selected base while it can still produce, like the
+/// selected unit's hull. Online, only on our turn.
 fn pulse_bases(
     game: Res<GameRes>,
     net: Option<Res<Net>>,
+    selected: Res<Selected>,
     time: Res<Time>,
     mut rims: Query<(&BaseRim, &mut Sprite)>,
 ) {
@@ -1703,8 +1753,9 @@ fn pulse_bases(
     let phase = (time.elapsed_secs() * 4.0).sin() * 0.5 + 0.5;
     for (rim, mut sprite) in &mut rims {
         let base = base_color(rim.holder);
-        let ready =
-            our_turn && rim.holder == Some(g.current) && g.can_produce_at(g.current, rim.pos);
+        let ready = our_turn
+            && *selected == Selected::Base(rim.pos)
+            && g.can_produce_at(g.current, rim.pos);
         sprite.color = if ready {
             base.mix(&Color::WHITE, 0.7 * phase)
         } else {
@@ -1829,8 +1880,8 @@ fn show_end_screen(
     if !existing.is_empty() {
         return;
     }
-    if selected.0.is_some() {
-        selected.0 = None;
+    if *selected != Selected::Nothing {
+        *selected = Selected::Nothing;
     }
 
     let (title, title_color, summary) = end_summary(g, result);
@@ -1971,7 +2022,13 @@ fn sync_hud(
     let our_turn = acting_player(g, net.as_deref()) == g.current;
     let all_done =
         g.result.is_none() && our_turn && !g.units.iter().any(|u| u.owner == g.current && !u.acted);
-    if let Some(u) = selected.0.and_then(|id| g.unit(id)) {
+    if let Some(p) = selected.base() {
+        let _ = writeln!(
+            s,
+            "Selected: base at ({}, {}) | P builds a tank, E a settler",
+            p.x, p.y
+        );
+    } else if let Some(u) = selected.unit().and_then(|id| g.unit(id)) {
         let _ = writeln!(
             s,
             "Selected: {} #{} at ({}, {}) strength {}{}",
@@ -1983,13 +2040,13 @@ fn sync_hud(
             if u.acted { " (done this turn)" } else { "" }
         );
     } else if g.result.is_none() && !all_done {
-        s.push_str("Selected: none (click one of your units or press Tab)\n");
+        s.push_str("Selected: none (click one of your units or bases, or press Tab)\n");
     }
     if all_done {
-        s.push_str("All your units have acted: produce at a blinking base (P / E) or press Space to end the turn.\n");
+        s.push_str("All your units have acted: produce at a base (P / E) or press Space to end the turn.\n");
     }
 
-    s.push_str("Blinking unit = selected (click or Tab), blinking base = can produce | Arrows move | P tank | E settler (at hovered base) | R raise (at own base) | F found base | Space end turn | M menu\n");
+    s.push_str("Blinking = selected unit or base (click or Tab) | Arrows move | P tank | E settler (at selected base) | R raise (at own base) | F found base | Space end turn | M menu\n");
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }
