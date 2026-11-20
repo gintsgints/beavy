@@ -180,7 +180,7 @@ enum AppState {
 struct GameRes(Game);
 
 /// What the player's keys act on, and the one thing that blinks: a unit
-/// (arrows, R, F) or a base that can still produce (P, E).
+/// (arrows, R, F) or a base that can still produce (T, E).
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum Selected {
     #[default]
@@ -1430,8 +1430,8 @@ fn handle_input(
                 .push("Select one of your units first (click it).".into());
             None
         }
-    } else if keys.any_just_pressed([KeyCode::KeyP, KeyCode::KeyE]) {
-        let kind = if keys.just_pressed(KeyCode::KeyP) {
+    } else if keys.any_just_pressed([KeyCode::KeyT, KeyCode::KeyE]) {
+        let kind = if keys.just_pressed(KeyCode::KeyT) {
             UnitKind::Tank
         } else {
             UnitKind::Settler
@@ -1985,7 +1985,7 @@ fn selection_line(g: &Game, selected: Selected) -> Option<String> {
                 b.ready
             ),
             None => format!(
-                "Selected: base at ({}, {}) | P builds a tank, E a settler ({BUILD_TURNS} turns)\n",
+                "Selected: base at ({}, {}) | T builds a tank, E a settler ({BUILD_TURNS} turns)\n",
                 p.x, p.y
             ),
         };
@@ -2079,12 +2079,12 @@ fn sync_hud(
         s.push_str("Selected: none (click one of your units or bases, or press Tab)\n");
     }
     if all_done {
-        s.push_str("All your units have acted: produce at a base (P / E) or press Space to end the turn.\n");
+        s.push_str("All your units have acted: produce at a base (T / E) or press Space to end the turn.\n");
     }
 
     let _ = writeln!(
         s,
-        "Blinking = selected unit or base (click or Tab) | Arrows move | P tank | E settler (at selected base, {BUILD_TURNS} turns) | R raise (at own base) | F found base | Space end turn | M menu"
+        "Blinking = selected unit or base (click or Tab) | Arrows move | T tank | E settler (at selected base, {BUILD_TURNS} turns) | R raise (at own base) | F found base | Space end turn | M menu"
     );
     if let Some(last) = g.log.last() {
         s.push_str(last);
