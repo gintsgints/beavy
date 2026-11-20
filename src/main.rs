@@ -235,6 +235,13 @@ struct Hull {
 #[derive(Component)]
 struct BaseFrame;
 
+/// The coloured outer frame of a base, which blinks while it can produce.
+#[derive(Component)]
+struct BaseRim {
+    pos: Pos,
+    holder: Option<usize>,
+}
+
 /// Shared mesh/material handles for tank parts.
 #[derive(Resource)]
 struct TankAssets {
@@ -423,6 +430,7 @@ fn main() {
                 sync_hover,
                 sync_hud,
                 pulse_selected,
+                pulse_bases,
                 show_end_screen,
             )
                 .chain()
@@ -1276,8 +1284,12 @@ fn selectable_units(g: &Game, owner: usize) -> Vec<u32> {
 }
 
 /// First unit of `owner` that can still act, used as the default selection.
+/// `None` once every unit has acted, so no spent unit looks selected.
 fn first_unit_of(g: &Game, owner: usize) -> Option<u32> {
-    selectable_units(g, owner).first().copied()
+    g.units
+        .iter()
+        .find(|u| u.owner == owner && !u.acted)
+        .map(|u| u.id)
 }
 
 /// Next ready unit of `owner` after `current` in unit order, wrapping around.
@@ -1678,6 +1690,29 @@ fn pulse_selected(
     }
 }
 
+/// Blink the frame of every base the player to act can still produce at, so
+/// an unused base is as easy to spot as an unmoved unit. Online, only on our turn.
+fn pulse_bases(
+    game: Res<GameRes>,
+    net: Option<Res<Net>>,
+    time: Res<Time>,
+    mut rims: Query<(&BaseRim, &mut Sprite)>,
+) {
+    let g = &game.0;
+    let our_turn = g.result.is_none() && acting_player(g, net.as_deref()) == g.current;
+    let phase = (time.elapsed_secs() * 4.0).sin() * 0.5 + 0.5;
+    for (rim, mut sprite) in &mut rims {
+        let base = base_color(rim.holder);
+        let ready =
+            our_turn && rim.holder == Some(g.current) && g.can_produce_at(g.current, rim.pos);
+        sprite.color = if ready {
+            base.mix(&Color::WHITE, 0.7 * phase)
+        } else {
+            base
+        };
+    }
+}
+
 /// Frame colour for a base: its holder's colour, grey when nobody holds it.
 fn base_color(holder: Option<usize>) -> Color {
     holder.map_or(Color::srgb(0.6, 0.6, 0.6), player_color)
@@ -1701,6 +1736,10 @@ fn sync_bases(
             Sprite::from_color(base_color(base.holder), Vec2::splat(CELL - 2.0)),
             Transform::from_translation(cell_center(base.pos, 0.2)),
             BaseFrame,
+            BaseRim {
+                pos: base.pos,
+                holder: base.holder,
+            },
             BoardEntity,
         ));
         commands.spawn((
@@ -1928,6 +1967,10 @@ fn sync_hud(
     s.push_str(&roster.join("  |  "));
     s.push('\n');
 
+    // Our turn and nothing left to move: say so instead of leaving no blinking unit.
+    let our_turn = acting_player(g, net.as_deref()) == g.current;
+    let all_done =
+        g.result.is_none() && our_turn && !g.units.iter().any(|u| u.owner == g.current && !u.acted);
     if let Some(u) = selected.0.and_then(|id| g.unit(id)) {
         let _ = writeln!(
             s,
@@ -1939,11 +1982,14 @@ fn sync_hud(
             u.strength,
             if u.acted { " (done this turn)" } else { "" }
         );
-    } else if g.result.is_none() {
+    } else if g.result.is_none() && !all_done {
         s.push_str("Selected: none (click one of your units or press Tab)\n");
     }
+    if all_done {
+        s.push_str("All your units have acted: produce at a blinking base (P / E) or press Space to end the turn.\n");
+    }
 
-    s.push_str("Blinking unit = selected (click or Tab) | Arrows move | P tank | E settler (at hovered base) | R raise (at own base) | F found base | Space end turn | M menu\n");
+    s.push_str("Blinking unit = selected (click or Tab), blinking base = can produce | Arrows move | P tank | E settler (at hovered base) | R raise (at own base) | F found base | Space end turn | M menu\n");
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }

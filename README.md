@@ -46,8 +46,10 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
     Every base needs two free tiles to every other base, diagonals included.
   - **Raise** a selected tank's strength by 1 (R) while it stands on or next to (not diagonally)
     a base you hold. Settlers cannot be raised.
-  - Space ends your turn. Spent units are dimmed; new units and bases you just captured or founded
-    wait for your next turn. `M` returns to the menu.
+  - Space ends your turn. It also ends by itself once none of your units or bases can do
+    anything, and a player who cannot do anything at all is skipped. Spent units are dimmed;
+    new units and bases you just captured or founded wait for your next turn. `M` returns to
+    the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
   Equal strength destroys both.
 - Settlers are peaceful, strength 0. A settler cannot enter a tile with another settler. A

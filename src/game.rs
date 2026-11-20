@@ -107,7 +107,8 @@ pub struct Base {
 }
 
 /// What a player may do on their turn: each unit acts once (move, raise or
-/// found), each held base produces once, then `Pass` ends the turn.
+/// found), each held base produces once, then `Pass` ends the turn. The turn
+/// also ends by itself once the player has nothing legal left to do.
 /// This is the only rules type that crosses the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -232,7 +233,7 @@ impl Rng {
 // Game state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Game {
     pub width: i32,
     pub height: i32,
@@ -382,6 +383,12 @@ impl Game {
         self.bases.iter().all(|b| b.pos.chebyshev(p) > BASE_GAP)
     }
 
+    /// Whether `player` could produce at the base on `p` right now: they hold
+    /// it, it has not produced this turn, and a cell on or next to it is free.
+    pub fn can_produce_at(&self, player: usize, p: Pos) -> bool {
+        self.production_spot(player, Some(p)).is_ok()
+    }
+
     pub fn alive_players(&self) -> impl Iterator<Item = usize> + '_ {
         self.players
             .iter()
@@ -397,8 +404,8 @@ impl Game {
     // -- actions ------------------------------------------------------------
 
     /// Apply the current player's action. `Pass` hands the turn to the next
-    /// living player; anything else spends the acting unit or base. On error
-    /// nothing changes.
+    /// living player; anything else spends the acting unit or base, and the
+    /// turn passes too once nothing is left to do. On error nothing changes.
     pub fn apply(&mut self, action: Action) -> Result<Outcome, ActionError> {
         if self.result.is_some() {
             return Err(ActionError::GameOver);
@@ -423,8 +430,30 @@ impl Game {
         self.check_victory();
         if action == Action::Pass {
             self.advance_turn();
+        } else if self.result.is_none() && !self.has_moves_left(me) {
+            self.log.push(format!(
+                "{} has nothing left to do; the turn passes.",
+                self.players[me].name
+            ));
+            self.advance_turn();
         }
         Ok(outcome)
+    }
+
+    /// Whether `player` could still do anything this turn besides passing:
+    /// a unit with a legal move, raise or found, or a base that can produce.
+    pub fn has_moves_left(&self, player: usize) -> bool {
+        self.production_spot(player, None).is_ok()
+            || self
+                .units
+                .iter()
+                .filter(|u| u.owner == player && !u.acted)
+                .any(|u| {
+                    DIRS.iter()
+                        .any(|&d| self.move_target(player, u.id, d).is_ok())
+                        || self.check_raise(player, u.id).is_ok()
+                        || self.check_found(player, u.id).is_ok()
+                })
     }
 
     /// A unit of `me` that has not acted yet this turn.
@@ -478,6 +507,21 @@ impl Game {
         kind: UnitKind,
         at: Option<Pos>,
     ) -> Result<Outcome, ActionError> {
+        let (base, spot) = self.production_spot(me, at)?;
+        let strength = match kind {
+            UnitKind::Tank => 1,
+            UnitKind::Settler => 0,
+        };
+        let unit = self.spawn(kind, me, spot, strength);
+        self.unit_mut(unit).acted = true;
+        if let Some(i) = self.base_at(base) {
+            self.bases[i].acted = true;
+        }
+        Ok(Outcome::Produced { unit, kind })
+    }
+
+    /// The base that would produce and the cell the new unit would take.
+    fn production_spot(&self, me: usize, at: Option<Pos>) -> Result<(Pos, Pos), ActionError> {
         let bases: Vec<Pos> = match at {
             Some(p) => {
                 let held = self
@@ -500,7 +544,7 @@ impl Game {
         if ready.is_empty() {
             return Err(ActionError::BaseAlreadyActed);
         }
-        let (base, spot) = ready
+        ready
             .iter()
             .flat_map(|&base| {
                 std::iter::once(base)
@@ -512,21 +556,20 @@ impl Game {
                     && self.terrain_at(p) == Terrain::Plain
                     && self.unit_at(p).is_none()
             })
-            .ok_or(ActionError::NoRoomAtBase)?;
-        let strength = match kind {
-            UnitKind::Tank => 1,
-            UnitKind::Settler => 0,
-        };
-        let unit = self.spawn(kind, me, spot, strength);
-        self.unit_mut(unit).acted = true;
-        if let Some(i) = self.base_at(base) {
-            self.bases[i].acted = true;
-        }
-        Ok(Outcome::Produced { unit, kind })
+            .ok_or(ActionError::NoRoomAtBase)
     }
 
     /// +1 strength for a tank on or orthogonally next to a base `me` holds.
     fn raise(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
+        self.check_raise(me, id)?;
+        let u = self.unit_mut(id);
+        u.strength += 1;
+        u.acted = true;
+        let strength = u.strength;
+        Ok(Outcome::Raised { unit: id, strength })
+    }
+
+    fn check_raise(&self, me: usize, id: u32) -> Result<(), ActionError> {
         let u = self.own_unit(me, id)?;
         if u.kind == UnitKind::Settler {
             return Err(ActionError::CannotRaiseSettler);
@@ -535,47 +578,23 @@ impl Game {
         if !self.held_bases(me).any(|b| b.manhattan(pos) <= 1) {
             return Err(ActionError::NotNearOwnBase);
         }
-        let u = self.unit_mut(id);
-        u.strength += 1;
-        u.acted = true;
-        let strength = u.strength;
-        Ok(Outcome::Raised { unit: id, strength })
+        Ok(())
     }
 
     fn move_unit(&mut self, me: usize, id: u32, dir: Dir) -> Result<Outcome, ActionError> {
-        let (from, strength, kind) = {
-            let u = self.own_unit(me, id)?;
-            (u.pos, u.strength, u.kind)
-        };
-        let to = from.step(dir);
-        if !self.in_bounds(to) {
-            return Err(ActionError::OffMap);
-        }
-        if self.terrain_at(to) == Terrain::Water {
-            return Err(ActionError::Water);
-        }
-        if self.unit_at(to).is_some_and(|u| u.owner == me) {
-            return Err(ActionError::OwnUnitThere);
-        }
-        // Settlers never fight each other; the tile is simply taken.
-        if kind == UnitKind::Settler
-            && self
-                .unit_at(to)
-                .is_some_and(|u| u.kind == UnitKind::Settler)
-        {
-            return Err(ActionError::SettlerThere);
-        }
+        let to = self.move_target(me, id, dir)?;
         let u = self.unit_mut(id);
         u.facing = dir;
         u.acted = true;
+        let (strength, kind) = (u.strength, u.kind);
 
-        let defender = self.unit_at(to).map(|u| (u.id, u.owner, u.strength));
+        let defender = self.unit_at(to).map(|u| (u.id, u.strength));
         let outcome = match defender {
             None => {
                 self.unit_mut(id).pos = to;
                 Outcome::Moved
             }
-            Some((def_id, _, def_strength)) => match strength.cmp(&def_strength) {
+            Some((def_id, def_strength)) => match strength.cmp(&def_strength) {
                 std::cmp::Ordering::Greater => {
                     self.remove_unit(def_id);
                     let a = self.unit_mut(id);
@@ -611,15 +630,32 @@ impl Game {
         Ok(outcome)
     }
 
-    fn found(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
+    /// Where unit `id` would end up moving `dir`, if that move is legal.
+    fn move_target(&self, me: usize, id: u32, dir: Dir) -> Result<Pos, ActionError> {
         let u = self.own_unit(me, id)?;
-        if u.kind != UnitKind::Settler {
-            return Err(ActionError::NotASettler);
+        let to = u.pos.step(dir);
+        if !self.in_bounds(to) {
+            return Err(ActionError::OffMap);
         }
-        let pos = u.pos;
-        if !self.can_found_at(pos) {
-            return Err(ActionError::TooCloseToBase);
+        if self.terrain_at(to) == Terrain::Water {
+            return Err(ActionError::Water);
         }
+        if self.unit_at(to).is_some_and(|t| t.owner == me) {
+            return Err(ActionError::OwnUnitThere);
+        }
+        // Settlers never fight each other; the tile is simply taken.
+        if u.kind == UnitKind::Settler
+            && self
+                .unit_at(to)
+                .is_some_and(|t| t.kind == UnitKind::Settler)
+        {
+            return Err(ActionError::SettlerThere);
+        }
+        Ok(to)
+    }
+
+    fn found(&mut self, me: usize, id: u32) -> Result<Outcome, ActionError> {
+        let pos = self.check_found(me, id)?;
         self.remove_unit(id);
         // Founded this turn: it produces from the next one.
         self.bases.push(Base {
@@ -630,6 +666,18 @@ impl Game {
         Ok(Outcome::Founded {
             base: self.bases.len() - 1,
         })
+    }
+
+    /// The tile settler `id` would found a base on, if it may.
+    fn check_found(&self, me: usize, id: u32) -> Result<Pos, ActionError> {
+        let u = self.own_unit(me, id)?;
+        if u.kind != UnitKind::Settler {
+            return Err(ActionError::NotASettler);
+        }
+        if !self.can_found_at(u.pos) {
+            return Err(ActionError::TooCloseToBase);
+        }
+        Ok(u.pos)
     }
 
     /// Take `player` out of the match (surrender or lost connection). Their
@@ -701,10 +749,35 @@ impl Game {
         }
     }
 
+    /// Hand the turn on, skipping players who could do nothing at all. If
+    /// nobody can act, the turn stays with the next player so they can pass.
     fn advance_turn(&mut self) {
         if self.result.is_some() {
             return;
         }
+        self.next_player();
+        let (next, turn) = (self.current, self.turn);
+        let mut skipped = Vec::new();
+        while !self.has_moves_left(self.current) {
+            skipped.push(self.current);
+            if skipped.len() >= self.alive_players().count() {
+                (self.current, self.turn) = (next, turn);
+                skipped.clear();
+                break;
+            }
+            self.next_player();
+        }
+        for p in skipped {
+            self.log.push(format!(
+                "{} has nothing to do; the turn passes.",
+                self.players[p].name
+            ));
+        }
+    }
+
+    /// The next living player in seat order takes the turn with fresh units
+    /// and bases.
+    fn next_player(&mut self) {
         let n = self.players.len();
         let prev = self.current;
         // Seat order counted from whoever moved first.
@@ -1040,7 +1113,7 @@ mod tests {
             panic!()
         };
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
-        g.apply(Action::Pass).unwrap();
+        assert_eq!(g.current, 1, "nothing left to do, so the turn passed");
         g.apply(Action::Pass).unwrap(); // player 2
         let Outcome::Produced { unit, .. } = g
             .apply(Action::Produce {
@@ -1248,8 +1321,7 @@ mod tests {
         };
         assert_eq!(kind, UnitKind::Settler);
         assert_eq!(g.unit(unit).unwrap().strength, 0);
-        g.apply(Action::Pass).unwrap();
-        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap(); // player 2; player 1 passed automatically
         assert_eq!(
             g.apply(Action::Raise { unit }),
             Err(ActionError::CannotRaiseSettler)
@@ -1428,6 +1500,7 @@ mod tests {
     fn each_base_produces_once_per_turn_and_new_units_wait() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(3, 3), 1);
+        g.spawn_unit(0, Pos::new(2, 4), 1); // keeps player 1's turn open
         g.bases.push(Base {
             pos: Pos::new(3, 0),
             holder: Some(0),
@@ -1464,10 +1537,34 @@ mod tests {
     }
 
     #[test]
+    fn can_produce_at_tracks_holder_use_and_room() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        g.spawn_unit(0, Pos::new(2, 4), 1); // keeps player 1's turn open
+        let home = Pos::new(0, 0);
+        assert!(g.can_produce_at(0, home));
+        assert!(!g.can_produce_at(0, Pos::new(5, 5)), "not held");
+        assert!(!g.can_produce_at(0, Pos::new(2, 2)), "no base there");
+        g.apply(Action::Produce {
+            kind: UnitKind::Tank,
+            at: Some(home),
+        })
+        .unwrap();
+        assert!(!g.can_produce_at(0, home), "already produced");
+
+        let mut full = arena();
+        for p in [home, Pos::new(1, 0), Pos::new(0, 1)] {
+            full.spawn_unit(1, p, 1);
+        }
+        assert!(!full.can_produce_at(0, home), "no free cell");
+    }
+
+    #[test]
     fn captured_base_produces_from_next_turn() {
         let mut g = arena();
         g.bases[0].holder = None;
         let a = g.spawn_unit(0, Pos::new(4, 5), 3);
+        g.spawn_unit(0, Pos::new(2, 2), 1); // keeps player 1's turn open
         g.spawn_unit(1, Pos::new(0, 5), 1);
         g.apply(Action::Move {
             unit: a,
@@ -1482,6 +1579,141 @@ mod tests {
         g.apply(Action::Pass).unwrap();
         g.apply(Action::Pass).unwrap();
         assert!(g.apply(tank).is_ok());
+    }
+
+    #[test]
+    fn turn_passes_by_itself_when_nothing_is_left() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        let a = g.spawn_unit(0, Pos::new(2, 0), 1);
+        let right = Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        };
+        g.apply(right).unwrap();
+        assert_eq!(g.current, 0, "home base can still produce");
+        g.apply(Action::Produce {
+            kind: UnitKind::Tank,
+            at: None,
+        })
+        .unwrap();
+        assert_eq!(g.current, 1);
+        assert!(g.log.iter().any(|l| l.contains("nothing left to do")));
+    }
+
+    #[test]
+    fn player_with_nothing_to_do_at_turn_start_is_skipped() {
+        let mut g = arena();
+        // Player 2 lost their base and their only tank is boxed in by water.
+        g.bases[1].holder = Some(0);
+        let stuck = g.spawn_unit(1, Pos::new(5, 0), 1);
+        g.terrain[idx(6, Pos::new(4, 0))] = Terrain::Water;
+        g.terrain[idx(6, Pos::new(5, 1))] = Terrain::Water;
+        g.spawn_unit(0, Pos::new(2, 2), 1);
+        assert!(!g.has_moves_left(1));
+        g.apply(Action::Pass).unwrap();
+        assert_eq!((g.current, g.turn), (0, 2), "player 2 was skipped");
+        assert!(g.players[1].alive, "skipped, not eliminated");
+        assert!(g.unit(stuck).is_some());
+        assert!(g
+            .log
+            .iter()
+            .any(|l| l == "Player 2 has nothing to do; the turn passes."));
+    }
+
+    #[test]
+    fn everyone_stuck_leaves_the_turn_with_the_next_player() {
+        let mut g = arena();
+        no_bases(&mut g);
+        for (owner, pos, water) in [
+            (0, Pos::new(0, 0), [Pos::new(1, 0), Pos::new(0, 1)]),
+            (1, Pos::new(5, 5), [Pos::new(4, 5), Pos::new(5, 4)]),
+        ] {
+            g.spawn_unit(owner, pos, 1);
+            for w in water {
+                g.terrain[idx(6, w)] = Terrain::Water;
+            }
+        }
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(g.current, 1, "no endless skipping when nobody can act");
+    }
+
+    #[test]
+    fn boxed_in_units_and_full_bases_count_as_nothing_left() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(3, 3), 1);
+        // Home (0,0) and both free neighbours are taken by player 1's units.
+        let a = g.spawn_unit(0, Pos::new(0, 0), 1);
+        g.spawn_unit(0, Pos::new(1, 0), 1);
+        g.spawn_unit(0, Pos::new(0, 1), 1);
+        for u in &mut g.units {
+            if u.owner == 0 && u.id != a {
+                u.acted = true;
+            }
+        }
+        assert!(g.has_moves_left(0), "the tank on the base can still raise");
+        g.apply(Action::Raise { unit: a }).unwrap();
+        assert_eq!(g.current, 1);
+    }
+
+    /// Every non-pass action the current player could try right now.
+    fn candidate_actions(g: &Game) -> Vec<Action> {
+        let me = g.current;
+        let mut out = Vec::new();
+        for u in g.units.iter().filter(|u| u.owner == me) {
+            for dir in DIRS {
+                out.push(Action::Move { unit: u.id, dir });
+            }
+            out.push(Action::Raise { unit: u.id });
+            out.push(Action::Found { unit: u.id });
+        }
+        for kind in [UnitKind::Tank, UnitKind::Settler] {
+            out.push(Action::Produce { kind, at: None });
+            for at in g.held_bases(me) {
+                out.push(Action::Produce { kind, at: Some(at) });
+            }
+        }
+        out
+    }
+
+    /// Random games: `has_moves_left` must agree with whether some action
+    /// really succeeds, and play never waits on a player who cannot act.
+    #[test]
+    fn turn_never_waits_on_a_player_with_nothing_to_do() {
+        // Small crowded boards, so bases fill up and units get boxed in.
+        for seed in 0..30 {
+            let players = 2 + usize::try_from(seed % 3).unwrap();
+            let mut g = Game::new(6, 6, players, seed);
+            let mut rng = Rng::new(seed);
+            for step in 0..300 {
+                if g.result.is_some() {
+                    break;
+                }
+                let legal: Vec<Action> = candidate_actions(&g)
+                    .into_iter()
+                    .filter(|&a| g.clone().apply(a).is_ok())
+                    .collect();
+                assert_eq!(
+                    g.has_moves_left(g.current),
+                    !legal.is_empty(),
+                    "seed {seed} step {step}: has_moves_left disagrees with the rules"
+                );
+                let nobody_can_act = g.alive_players().all(|p| !g.has_moves_left(p));
+                assert!(
+                    !legal.is_empty() || nobody_can_act,
+                    "seed {seed} step {step}: {} has nothing to do but still has the turn",
+                    g.current_player().name
+                );
+                // Mostly act, sometimes end the turn early.
+                let action = if legal.is_empty() || rng.chance(0.1) {
+                    Action::Pass
+                } else {
+                    let n = i32::try_from(legal.len()).unwrap();
+                    legal[usize::try_from(rng.below(n)).unwrap()]
+                };
+                g.apply(action).unwrap();
+            }
+        }
     }
 
     #[test]
