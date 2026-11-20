@@ -241,6 +241,8 @@ pub struct Game {
     pub bases: Vec<Base>,
     pub units: Vec<Unit>,
     pub current: usize,
+    /// Who moved first; a new turn number starts each time play reaches them.
+    pub first: usize,
     pub turn: u32,
     pub result: Option<GameOver>,
     pub log: Vec<String>,
@@ -306,6 +308,7 @@ impl Game {
             bases,
             units: Vec::new(),
             current: 0,
+            first: 0,
             turn: 1,
             result: None,
             log: vec![format!("Map {}x{}, seed {}", width, height, seed)],
@@ -316,6 +319,21 @@ impl Game {
             let base = game.bases[i].pos;
             game.spawn_unit(i, base, 1);
         }
+        game
+    }
+
+    /// Same as `new`, but `first` moves first (wrapped to the player count).
+    /// Used for rematches so the opening move rotates.
+    pub fn with_first_player(
+        width: i32,
+        height: i32,
+        n_players: usize,
+        seed: u64,
+        first: usize,
+    ) -> Game {
+        let mut game = Game::new(width, height, n_players, seed);
+        game.first = first % n_players;
+        game.current = game.first;
         game
     }
 
@@ -689,10 +707,12 @@ impl Game {
         }
         let n = self.players.len();
         let prev = self.current;
+        // Seat order counted from whoever moved first.
+        let order = |i: usize| (i + n - self.first) % n;
         for step in 1..=n {
             let idx = (prev + step) % n;
             if self.players[idx].alive {
-                if idx <= prev {
+                if order(idx) <= order(prev) {
                     self.turn += 1;
                 }
                 self.current = idx;
@@ -1476,6 +1496,32 @@ mod tests {
         g.apply(Action::Pass).unwrap();
         assert_eq!(g.current, 0);
         assert_eq!(g.turn, 2);
+    }
+
+    #[test]
+    fn rematch_rotates_first_player_and_turn_counter() {
+        let a = Game::new(8, 8, 3, 4);
+        let mut g = Game::with_first_player(8, 8, 3, 4, 4);
+        assert_eq!(g.terrain, a.terrain, "same seed, same map");
+        assert_eq!(g.bases, a.bases);
+        assert_eq!(g.current, 1);
+        for expected in [2, 0] {
+            g.apply(Action::Pass).unwrap();
+            assert_eq!((g.current, g.turn), (expected, 1));
+        }
+        g.apply(Action::Pass).unwrap();
+        assert_eq!((g.current, g.turn), (1, 2));
+    }
+
+    #[test]
+    fn turn_counter_follows_first_player_when_they_are_out() {
+        let mut g = Game::with_first_player(8, 8, 3, 4, 1);
+        g.resign(1);
+        assert_eq!((g.current, g.turn), (2, 1));
+        g.apply(Action::Pass).unwrap();
+        assert_eq!((g.current, g.turn), (0, 1));
+        g.apply(Action::Pass).unwrap();
+        assert_eq!((g.current, g.turn), (2, 2));
     }
 
     #[test]

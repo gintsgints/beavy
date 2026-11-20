@@ -61,7 +61,8 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
 - A player who resigns (or does not reconnect in time) is out; bases they held turn grey
   (neutral) and anyone can capture them.
 - Last player alive wins. If the last players knock each other out at once, the game is a draw.
-- The end screen offers Play again (same settings, Enter) or Menu (M).
+- The end screen offers Play again (Enter) or Menu (M). Play again keeps the same map and settings
+  and hands the first move to the next player; starting from the menu, Player 1 opens again.
 
 ## Layout
 

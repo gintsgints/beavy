@@ -63,6 +63,8 @@ struct Settings {
     reconnect_secs: u32,
     /// `--host` / `--join` on the command line: connect without waiting for Enter.
     autostart: bool,
+    /// Hot-seat: who moves first. Each "Play again" passes it to the next seat.
+    first_player: usize,
 }
 
 impl Settings {
@@ -101,6 +103,7 @@ fn parse_args() -> Launch {
         code: String::new(),
         reconnect_secs: DEFAULT_RECONNECT_SECS,
         autostart: false,
+        first_player: 0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -378,7 +381,10 @@ fn main() {
         .init_state::<AppState>()
         .add_systems(Startup, (spawn_camera, load_tank_assets))
         // Menu
-        .add_systems(OnEnter(AppState::Menu), build_menu)
+        .add_systems(
+            OnEnter(AppState::Menu),
+            (|mut s: ResMut<Settings>| s.first_player = 0, build_menu),
+        )
         .add_systems(
             Update,
             (menu_autostart, menu_keys, menu_typing, sync_menu_values)
@@ -388,7 +394,9 @@ fn main() {
         .add_systems(Update, handle_buttons)
         .add_systems(
             OnEnter(AppState::Restart),
-            |mut next: ResMut<NextState<AppState>>| {
+            |mut settings: ResMut<Settings>, mut next: ResMut<NextState<AppState>>| {
+                // Same map, the next seat opens.
+                settings.first_player = (settings.first_player + 1) % settings.players;
                 next.set(AppState::Playing);
             },
         )
@@ -1120,7 +1128,13 @@ fn build_board(
     let ms = net
         .as_ref()
         .map_or_else(|| settings.match_settings(), |n| n.settings);
-    let mut game = Game::new(ms.width, ms.height, ms.players, ms.seed);
+    // Online, seat 0 always opens; hot-seat rematches rotate the opener.
+    let first = if net.is_some() {
+        0
+    } else {
+        settings.first_player
+    };
+    let mut game = Game::with_first_player(ms.width, ms.height, ms.players, ms.seed, first);
     if let Some(net) = &net {
         for (p, seat) in game.players.iter_mut().zip(&net.roster) {
             if let Some(name) = seat {
@@ -1764,6 +1778,7 @@ fn end_summary(g: &Game, result: GameOver) -> (String, Color, Vec<String>) {
 fn show_end_screen(
     mut commands: Commands,
     game: Res<GameRes>,
+    settings: Res<Settings>,
     net: Option<Res<Net>>,
     mut selected: ResMut<Selected>,
     existing: Query<(), With<EndScreen>>,
@@ -1832,12 +1847,13 @@ fn show_end_screen(
             .with_children(|row| {
                 // Online rematches would need a new room; go via the menu.
                 if net.is_none() {
+                    let opener = (settings.first_player + 1) % g.players.len();
                     spawn_button(
                         row,
-                        "Play again (Enter)",
+                        &format!("Play again, {} starts (Enter)", color_name(opener)),
                         MenuAction::Replay,
                         START,
-                        230.0,
+                        330.0,
                         &font(20.0),
                     );
                 }
