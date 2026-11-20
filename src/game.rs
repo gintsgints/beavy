@@ -118,7 +118,7 @@ pub struct Base {
 
 /// Turns from ordering a unit to it rolling out: ordered on turn N, it
 /// appears at the start of its owner's turn N + `BUILD_TURNS`.
-pub const BUILD_TURNS: u32 = 3;
+pub const BUILD_TURNS: u32 = 5;
 
 /// A unit under construction at a base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

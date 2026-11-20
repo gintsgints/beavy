@@ -44,7 +44,7 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
   - **Move** a selected tank one cell (arrows / WASD).
   - **Produce** a tank of strength 1 (T) or an explorer (E) at a base you hold: the selected
     base, else a held base under the cursor, else your home base first, then the others.
-    Building takes 3 turns: ordered on turn 5, the unit rolls out at the start of your turn 8,
+    Building takes 5 turns: ordered on turn 5, the unit rolls out at the start of your turn 10,
     on or next to the base, and can act at once. A base builds one unit at a time (its tile
     shows e.g. `T2`: a tank, 2 turns left). If every cell there is taken, the unit waits for
     room. A base that is captured loses its build.
