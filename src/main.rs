@@ -1434,7 +1434,7 @@ fn handle_input(
         let kind = if keys.just_pressed(KeyCode::KeyT) {
             UnitKind::Tank
         } else {
-            UnitKind::Settler
+            UnitKind::Explorer
         };
         // Produce at the selected base, else the held base under the cursor,
         // else let the rules pick.
@@ -1448,7 +1448,9 @@ fn handle_input(
         if let Some(unit) = selected.unit() {
             Some(Action::Found { unit })
         } else {
-            game.0.log.push("Select a settler to found a base.".into());
+            game.0
+                .log
+                .push("Select an explorer to found a base.".into());
             None
         }
     } else if keys.just_pressed(KeyCode::KeyR) {
@@ -1584,7 +1586,7 @@ fn sync_units(
     for u in &game.0.units {
         match u.kind {
             UnitKind::Tank => spawn_tank(&mut commands, &assets, u),
-            UnitKind::Settler => spawn_settler(&mut commands, u),
+            UnitKind::Explorer => spawn_explorer(&mut commands, u),
         }
     }
 }
@@ -1673,11 +1675,13 @@ fn spawn_tank(commands: &mut Commands, assets: &TankAssets, u: &game::Unit) {
         });
 }
 
-/// Top-down settler wagon: canvas cover in the owner's colour on a dark bed
-/// with four wheels. No strength badge; settlers are always 0.
-fn spawn_settler(commands: &mut Commands, u: &game::Unit) {
+/// Top-down explorer: shoulders in the owner's colour under a wide-brimmed
+/// hat, with a backpack behind. No strength badge; explorers are always 0.
+fn spawn_explorer(commands: &mut Commands, u: &game::Unit) {
     let dark = Color::srgb(0.13, 0.13, 0.14);
-    let bed = Color::srgb(0.45, 0.32, 0.18);
+    let pack = Color::srgb(0.45, 0.32, 0.18);
+    let brim = Color::srgb(0.76, 0.66, 0.44);
+    let crown = Color::srgb(0.58, 0.48, 0.30);
     commands
         .spawn((
             Transform::from_translation(cell_center(u.pos, 1.0)),
@@ -1686,31 +1690,33 @@ fn spawn_settler(commands: &mut Commands, u: &game::Unit) {
             BoardEntity,
         ))
         .with_children(|root| {
-            for (x, y) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            // Backpack, then arms either side of the body.
+            root.spawn((
+                Sprite::from_color(pack, Vec2::new(CELL * 0.34, CELL * 0.18)),
+                Transform::from_xyz(0.0, -CELL * 0.2, 0.0),
+            ));
+            for x in [-1.0, 1.0] {
                 root.spawn((
-                    Sprite::from_color(dark, Vec2::new(CELL * 0.16, CELL * 0.10)),
-                    Transform::from_xyz(x * CELL * 0.22, y * CELL * 0.24, 0.0),
+                    Sprite::from_color(dark, Vec2::new(CELL * 0.1, CELL * 0.26)),
+                    Transform::from_xyz(x * CELL * 0.27, -CELL * 0.02, 0.0),
                 ));
             }
             root.spawn((
-                Sprite::from_color(bed, Vec2::new(CELL * 0.62, CELL * 0.42)),
-                Transform::from_xyz(0.0, 0.0, 0.05),
-            ));
-            root.spawn((
-                Sprite::from_color(player_color(u.owner), Vec2::new(CELL * 0.50, CELL * 0.32)),
-                Transform::from_xyz(0.0, 0.0, 0.1),
+                Sprite::from_color(player_color(u.owner), Vec2::new(CELL * 0.46, CELL * 0.3)),
+                Transform::from_xyz(0.0, -CELL * 0.02, 0.05),
                 Hull {
                     unit: u.id,
                     owner: u.owner,
                 },
             ));
-            // Cover hoops.
-            for k in -1..=1 {
-                root.spawn((
-                    Sprite::from_color(Color::WHITE, Vec2::new(CELL * 0.04, CELL * 0.32)),
-                    Transform::from_xyz(grid_f32(k) * CELL * 0.14, 0.0, 0.15),
-                ));
-            }
+            root.spawn((
+                Sprite::from_color(brim, Vec2::splat(CELL * 0.36)),
+                Transform::from_xyz(0.0, CELL * 0.06, 0.1),
+            ));
+            root.spawn((
+                Sprite::from_color(crown, Vec2::splat(CELL * 0.18)),
+                Transform::from_xyz(0.0, CELL * 0.06, 0.15),
+            ));
         });
 }
 
@@ -1803,7 +1809,7 @@ fn sync_bases(
         if let Some(build) = base.build {
             let letter = match build.kind {
                 UnitKind::Tank => 'T',
-                UnitKind::Settler => 'S',
+                UnitKind::Explorer => 'E',
             };
             let left = build.ready.saturating_sub(game.0.turn);
             commands.spawn((
@@ -1978,14 +1984,14 @@ fn selection_line(g: &Game, selected: Selected) -> Option<String> {
     if let Some(p) = selected.base() {
         let line = match g.base_at(p).and_then(|i| g.bases[i].build) {
             Some(b) => format!(
-                "Selected: base at ({}, {}) | building a {}, rolls out on turn {}\n",
+                "Selected: base at ({}, {}) | building {}, rolls out on turn {}\n",
                 p.x,
                 p.y,
-                b.kind.name(),
+                b.kind.a_name(),
                 b.ready
             ),
             None => format!(
-                "Selected: base at ({}, {}) | T builds a tank, E a settler ({BUILD_TURNS} turns)\n",
+                "Selected: base at ({}, {}) | T builds a tank, E an explorer ({BUILD_TURNS} turns)\n",
                 p.x, p.y
             ),
         };
@@ -2060,10 +2066,10 @@ fn sync_hud(
             }
             let own = || g.units.iter().filter(move |u| u.owner == i);
             let tanks = own().filter(|u| u.kind == UnitKind::Tank).count();
-            let settlers = own().filter(|u| u.kind == UnitKind::Settler).count();
+            let explorers = own().filter(|u| u.kind == UnitKind::Explorer).count();
             let power: u32 = own().map(|u| u.strength).sum();
             let bases = g.held_bases(i).count();
-            format!("{}: {tanks}t {settlers}s {bases}b {power}p", p.name)
+            format!("{}: {tanks}t {explorers}e {bases}b {power}p", p.name)
         })
         .collect();
     s.push_str(&roster.join("  |  "));
@@ -2084,7 +2090,7 @@ fn sync_hud(
 
     let _ = writeln!(
         s,
-        "Blinking = selected unit or base (click or Tab) | Arrows move | T tank | E settler (at selected base, {BUILD_TURNS} turns) | R raise (at own base) | F found base | Space end turn | M menu"
+        "Blinking = selected unit or base (click or Tab) | Arrows move | T tank | E explorer (at selected base, {BUILD_TURNS} turns) | R raise (at own base) | F found base | Space end turn | M menu"
     );
     if let Some(last) = g.log.last() {
         s.push_str(last);

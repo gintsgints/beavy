@@ -42,29 +42,29 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
   Exactly one thing blinks: the selected unit, or the selected base once your units are done.
   Click a unit or base, or press Tab to cycle through what can still act:
   - **Move** a selected tank one cell (arrows / WASD).
-  - **Produce** a tank of strength 1 (T) or a settler (E) at a base you hold: the selected
+  - **Produce** a tank of strength 1 (T) or an explorer (E) at a base you hold: the selected
     base, else a held base under the cursor, else your home base first, then the others.
     Building takes 3 turns: ordered on turn 5, the unit rolls out at the start of your turn 8,
     on or next to the base, and can act at once. A base builds one unit at a time (its tile
     shows e.g. `T2`: a tank, 2 turns left). If every cell there is taken, the unit waits for
     room. A base that is captured loses its build.
-  - **Found** a base with the selected settler (F): the settler becomes a base on its tile.
+  - **Found** a base with the selected explorer (F): the explorer becomes a base on its tile.
     Every base needs two free tiles to every other base, diagonals included.
   - **Raise** a selected tank's strength by 1 (R) while it stands on or next to (not diagonally)
-    a base you hold. Settlers cannot be raised.
+    a base you hold. Explorers cannot be raised.
   - Space ends your turn. It also ends by itself once none of your units or bases can do
     anything, and a player who cannot do anything at all is skipped. Spent units are dimmed;
     bases you just captured or founded start building from your next turn. `M` returns to
     the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
   Equal strength destroys both.
-- Settlers are peaceful, strength 0. A settler cannot enter a tile with another settler. A
-  settler moving onto an enemy tank is destroyed; a tank moving onto a settler destroys it
-  and keeps its strength. Settlers never capture bases.
+- Explorers are peaceful, strength 0. An explorer cannot enter a tile with another explorer. An
+  explorer moving onto an enemy tank is destroyed; a tank moving onto an explorer destroys it
+  and keeps its strength. Explorers never capture bases.
 - A tank ending a move on a base you do not hold captures it; its frame takes your colour. You produce
   at every base you hold (your home base first). A player whose home base is taken stays in
   the game and can retake it the same way.
-- A player is eliminated only when they have no units (tanks or settlers) and hold no base.
+- A player is eliminated only when they have no units (tanks or explorers) and hold no base.
   With a base left they stay in and can produce again; losing that base while unitless ends them.
 - A player who resigns (or does not reconnect in time) is out; bases they held turn grey
   (neutral) and anyone can capture them.

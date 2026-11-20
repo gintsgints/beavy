@@ -63,14 +63,22 @@ pub enum UnitKind {
     /// Fights and captures bases.
     Tank,
     /// Strength 0, never captures, cannot be raised. Founds new bases.
-    Settler,
+    Explorer,
 }
 
 impl UnitKind {
     pub fn name(self) -> &'static str {
         match self {
             UnitKind::Tank => "tank",
-            UnitKind::Settler => "settler",
+            UnitKind::Explorer => "explorer",
+        }
+    }
+
+    /// The name with its indefinite article, e.g. "an explorer".
+    pub fn a_name(self) -> &'static str {
+        match self {
+            UnitKind::Tank => "a tank",
+            UnitKind::Explorer => "an explorer",
         }
     }
 }
@@ -95,7 +103,7 @@ pub struct Player {
 }
 
 /// A production site. `Game::bases[i]` for `i < players.len()` is player
-/// `i`'s home base; later entries were founded by settlers, in order.
+/// `i`'s home base; later entries were founded by explorers, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Base {
     pub pos: Pos,
@@ -140,7 +148,7 @@ pub enum Action {
     Raise {
         unit: u32,
     },
-    /// Turn a settler into a base on its tile.
+    /// Turn an explorer into a base on its tile.
     Found {
         unit: u32,
     },
@@ -156,12 +164,12 @@ pub enum ActionError {
     OffMap,
     Water,
     OwnUnitThere,
-    SettlerThere,
+    ExplorerThere,
     NoBase,
     NotYourBase,
     BaseBusy,
-    CannotRaiseSettler,
-    NotASettler,
+    CannotRaiseExplorer,
+    NotAExplorer,
     TooCloseToBase,
     UnitAlreadyActed,
     BaseAlreadyActed,
@@ -177,12 +185,12 @@ impl std::fmt::Display for ActionError {
             ActionError::OffMap => "cannot move off the map",
             ActionError::Water => "cannot drive into water",
             ActionError::OwnUnitThere => "one of your tanks is already there",
-            ActionError::SettlerThere => "a settler is already there",
+            ActionError::ExplorerThere => "an explorer is already there",
             ActionError::NoBase => "you hold no base to produce at",
             ActionError::NotYourBase => "you do not hold that base",
             ActionError::BaseBusy => "that base is still building",
-            ActionError::CannotRaiseSettler => "settlers cannot be raised",
-            ActionError::NotASettler => "only settlers can found a base",
+            ActionError::CannotRaiseExplorer => "explorers cannot be raised",
+            ActionError::NotAExplorer => "only explorers can found a base",
             ActionError::TooCloseToBase => "too close to a base: keep two free tiles between bases",
             ActionError::UnitAlreadyActed => "that unit has already acted this turn",
             ActionError::BaseAlreadyActed => "that base has already produced this turn",
@@ -605,7 +613,7 @@ impl Game {
             };
             let strength = match kind {
                 UnitKind::Tank => 1,
-                UnitKind::Settler => 0,
+                UnitKind::Explorer => 0,
             };
             let unit = self.spawn(kind, me, spot, strength);
             self.bases[i].build = None;
@@ -626,8 +634,8 @@ impl Game {
 
     fn check_raise(&self, me: usize, id: u32) -> Result<(), ActionError> {
         let u = self.own_unit(me, id)?;
-        if u.kind == UnitKind::Settler {
-            return Err(ActionError::CannotRaiseSettler);
+        if u.kind == UnitKind::Explorer {
+            return Err(ActionError::CannotRaiseExplorer);
         }
         let pos = u.pos;
         if !self.held_bases(me).any(|b| b.manhattan(pos) <= 1) {
@@ -698,13 +706,13 @@ impl Game {
         if self.unit_at(to).is_some_and(|t| t.owner == me) {
             return Err(ActionError::OwnUnitThere);
         }
-        // Settlers never fight each other; the tile is simply taken.
-        if u.kind == UnitKind::Settler
+        // Explorers never fight each other; the tile is simply taken.
+        if u.kind == UnitKind::Explorer
             && self
                 .unit_at(to)
-                .is_some_and(|t| t.kind == UnitKind::Settler)
+                .is_some_and(|t| t.kind == UnitKind::Explorer)
         {
-            return Err(ActionError::SettlerThere);
+            return Err(ActionError::ExplorerThere);
         }
         Ok(to)
     }
@@ -724,11 +732,11 @@ impl Game {
         })
     }
 
-    /// The tile settler `id` would found a base on, if it may.
+    /// The tile explorer `id` would found a base on, if it may.
     fn check_found(&self, me: usize, id: u32) -> Result<Pos, ActionError> {
         let u = self.own_unit(me, id)?;
-        if u.kind != UnitKind::Settler {
-            return Err(ActionError::NotASettler);
+        if u.kind != UnitKind::Explorer {
+            return Err(ActionError::NotAExplorer);
         }
         if !self.can_found_at(u.pos) {
             return Err(ActionError::TooCloseToBase);
@@ -866,15 +874,15 @@ impl Game {
             (_, Outcome::Passed) => format!("{name} ended their turn."),
             (_, Outcome::Ordered { kind, ready }) => {
                 format!(
-                    "{name} started a {}; it rolls out on turn {ready}.",
-                    kind.name()
+                    "{name} started {}; it rolls out on turn {ready}.",
+                    kind.a_name()
                 )
             }
             (_, Outcome::Raised { unit, strength }) => {
                 format!("{name} raised {noun} #{unit} to strength {strength}.")
             }
             (Action::Found { unit }, Outcome::Founded { .. }) => {
-                format!("{name}'s settler #{unit} founded a new base.")
+                format!("{name}'s explorer #{unit} founded a new base.")
             }
             (Action::Move { unit, .. }, Outcome::Moved) => format!("{name} moved {noun} #{unit}."),
             (Action::Move { unit, .. }, Outcome::AttackerWon { remaining }) => {
@@ -1374,25 +1382,25 @@ mod tests {
         }
     }
 
-    fn settler(g: &mut Game, owner: usize, pos: Pos) -> u32 {
-        g.spawn(UnitKind::Settler, owner, pos, 0)
+    fn explorer(g: &mut Game, owner: usize, pos: Pos) -> u32 {
+        g.spawn(UnitKind::Explorer, owner, pos, 0)
     }
 
     #[test]
-    fn produce_settler_has_zero_strength_and_cannot_be_raised() {
+    fn produce_explorer_has_zero_strength_and_cannot_be_raised() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1);
         g.apply(Action::Produce {
-            kind: UnitKind::Settler,
+            kind: UnitKind::Explorer,
             at: None,
         })
         .unwrap();
         let unit = roll_out(&mut g, 0);
         let u = g.unit(unit).unwrap();
-        assert_eq!((u.kind, u.strength), (UnitKind::Settler, 0));
+        assert_eq!((u.kind, u.strength), (UnitKind::Explorer, 0));
         assert_eq!(
             g.apply(Action::Raise { unit }),
-            Err(ActionError::CannotRaiseSettler)
+            Err(ActionError::CannotRaiseExplorer)
         );
     }
 
@@ -1423,10 +1431,10 @@ mod tests {
     }
 
     #[test]
-    fn settler_founds_base_and_is_consumed() {
+    fn explorer_founds_base_and_is_consumed() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1);
-        let s = settler(&mut g, 0, Pos::new(3, 0));
+        let s = explorer(&mut g, 0, Pos::new(3, 0));
         assert_eq!(
             g.apply(Action::Found { unit: s }),
             Ok(Outcome::Founded { base: 2 })
@@ -1457,7 +1465,7 @@ mod tests {
         ] {
             assert_eq!(g.can_found_at(pos), ok, "{pos:?}");
         }
-        let s = settler(&mut g, 0, Pos::new(2, 1));
+        let s = explorer(&mut g, 0, Pos::new(2, 1));
         assert_eq!(
             g.apply(Action::Found { unit: s }),
             Err(ActionError::TooCloseToBase)
@@ -1465,22 +1473,22 @@ mod tests {
         let t = g.spawn_unit(0, Pos::new(3, 0), 1);
         assert_eq!(
             g.apply(Action::Found { unit: t }),
-            Err(ActionError::NotASettler)
+            Err(ActionError::NotAExplorer)
         );
     }
 
     #[test]
-    fn settler_blocked_by_settler_and_loses_to_tank() {
+    fn explorer_blocked_by_explorer_and_loses_to_tank() {
         let mut g = arena();
-        let s = settler(&mut g, 0, Pos::new(2, 2));
-        settler(&mut g, 1, Pos::new(3, 2));
+        let s = explorer(&mut g, 0, Pos::new(2, 2));
+        explorer(&mut g, 1, Pos::new(3, 2));
         let tank = g.spawn_unit(1, Pos::new(2, 3), 2);
         assert_eq!(
             g.apply(Action::Move {
                 unit: s,
                 dir: Dir::Right
             }),
-            Err(ActionError::SettlerThere)
+            Err(ActionError::ExplorerThere)
         );
         assert_eq!(
             g.apply(Action::Move {
@@ -1494,10 +1502,10 @@ mod tests {
     }
 
     #[test]
-    fn tank_destroys_settler_at_no_cost() {
+    fn tank_destroys_explorer_at_no_cost() {
         let mut g = arena();
         let a = g.spawn_unit(0, Pos::new(2, 2), 2);
-        let s = settler(&mut g, 1, Pos::new(3, 2));
+        let s = explorer(&mut g, 1, Pos::new(3, 2));
         g.spawn_unit(1, Pos::new(5, 5), 1);
         assert_eq!(
             g.apply(Action::Move {
@@ -1510,9 +1518,9 @@ mod tests {
     }
 
     #[test]
-    fn settler_does_not_capture_bases() {
+    fn explorer_does_not_capture_bases() {
         let mut g = arena();
-        let s = settler(&mut g, 0, Pos::new(4, 5));
+        let s = explorer(&mut g, 0, Pos::new(4, 5));
         g.spawn_unit(1, Pos::new(0, 5), 1);
         g.apply(Action::Move {
             unit: s,
@@ -1523,11 +1531,11 @@ mod tests {
     }
 
     #[test]
-    fn player_with_only_settlers_stays_in() {
+    fn player_with_only_explorers_stays_in() {
         let mut g = arena();
         let a = g.spawn_unit(0, Pos::new(2, 2), 3);
         g.spawn_unit(1, Pos::new(3, 2), 1);
-        settler(&mut g, 1, Pos::new(5, 0));
+        explorer(&mut g, 1, Pos::new(5, 0));
         g.apply(Action::Move {
             unit: a,
             dir: Dir::Right,
@@ -1783,7 +1791,7 @@ mod tests {
             out.push(Action::Raise { unit: u.id });
             out.push(Action::Found { unit: u.id });
         }
-        for kind in [UnitKind::Tank, UnitKind::Settler] {
+        for kind in [UnitKind::Tank, UnitKind::Explorer] {
             out.push(Action::Produce { kind, at: None });
             for at in g.held_bases(me) {
                 out.push(Action::Produce { kind, at: Some(at) });
