@@ -9,7 +9,7 @@ mod server;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use game::{Action, Dir, Game, GameOver, Pos, Terrain, UnitKind};
+use game::{Action, Dir, Game, GameOver, Pos, Terrain, UnitKind, BUILD_TURNS};
 use net::{Client, ClientMsg, Event, MatchSettings, ServerMsg};
 use std::fmt::Write as _;
 
@@ -1799,6 +1799,27 @@ fn sync_bases(
             BaseFrame,
             BoardEntity,
         ));
+        // What is being built and turns left, e.g. "T2", in the corner above units.
+        if let Some(build) = base.build {
+            let letter = match build.kind {
+                UnitKind::Tank => 'T',
+                UnitKind::Settler => 'S',
+            };
+            let left = build.ready.saturating_sub(game.0.turn);
+            commands.spawn((
+                Text2d::new(format!("{letter}{left}")),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.85, 0.30)),
+                Transform::from_translation(
+                    cell_center(base.pos, 5.0) + Vec3::new(-CELL * 0.3, -CELL * 0.33, 0.0),
+                ),
+                BaseFrame,
+                BoardEntity,
+            ));
+        }
     }
 }
 
@@ -1952,6 +1973,36 @@ fn show_end_screen(
         });
 }
 
+/// The HUD line describing the selected unit or base, if any.
+fn selection_line(g: &Game, selected: Selected) -> Option<String> {
+    if let Some(p) = selected.base() {
+        let line = match g.base_at(p).and_then(|i| g.bases[i].build) {
+            Some(b) => format!(
+                "Selected: base at ({}, {}) | building a {}, rolls out on turn {}\n",
+                p.x,
+                p.y,
+                b.kind.name(),
+                b.ready
+            ),
+            None => format!(
+                "Selected: base at ({}, {}) | P builds a tank, E a settler ({BUILD_TURNS} turns)\n",
+                p.x, p.y
+            ),
+        };
+        return Some(line);
+    }
+    let u = selected.unit().and_then(|id| g.unit(id))?;
+    Some(format!(
+        "Selected: {} #{} at ({}, {}) strength {}{}\n",
+        u.kind.name(),
+        u.id,
+        u.pos.x,
+        u.pos.y,
+        u.strength,
+        if u.acted { " (done this turn)" } else { "" }
+    ))
+}
+
 fn sync_hud(
     game: Res<GameRes>,
     net: Option<Res<Net>>,
@@ -2022,23 +2073,8 @@ fn sync_hud(
     let our_turn = acting_player(g, net.as_deref()) == g.current;
     let all_done =
         g.result.is_none() && our_turn && !g.units.iter().any(|u| u.owner == g.current && !u.acted);
-    if let Some(p) = selected.base() {
-        let _ = writeln!(
-            s,
-            "Selected: base at ({}, {}) | P builds a tank, E a settler",
-            p.x, p.y
-        );
-    } else if let Some(u) = selected.unit().and_then(|id| g.unit(id)) {
-        let _ = writeln!(
-            s,
-            "Selected: {} #{} at ({}, {}) strength {}{}",
-            u.kind.name(),
-            u.id,
-            u.pos.x,
-            u.pos.y,
-            u.strength,
-            if u.acted { " (done this turn)" } else { "" }
-        );
+    if let Some(line) = selection_line(g, *selected) {
+        s.push_str(&line);
     } else if g.result.is_none() && !all_done {
         s.push_str("Selected: none (click one of your units or bases, or press Tab)\n");
     }
@@ -2046,7 +2082,10 @@ fn sync_hud(
         s.push_str("All your units have acted: produce at a base (P / E) or press Space to end the turn.\n");
     }
 
-    s.push_str("Blinking = selected unit or base (click or Tab) | Arrows move | P tank | E settler (at selected base) | R raise (at own base) | F found base | Space end turn | M menu\n");
+    let _ = writeln!(
+        s,
+        "Blinking = selected unit or base (click or Tab) | Arrows move | P tank | E settler (at selected base, {BUILD_TURNS} turns) | R raise (at own base) | F found base | Space end turn | M menu"
+    );
     if let Some(last) = g.log.last() {
         s.push_str(last);
     }

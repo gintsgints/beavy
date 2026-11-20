@@ -104,10 +104,24 @@ pub struct Base {
     pub holder: Option<usize>,
     /// Already produced this turn. Cleared when a turn starts.
     pub acted: bool,
+    /// The unit being built here, if any. Lost when the base changes hands.
+    pub build: Option<Build>,
+}
+
+/// Turns from ordering a unit to it rolling out: ordered on turn N, it
+/// appears at the start of its owner's turn N + `BUILD_TURNS`.
+pub const BUILD_TURNS: u32 = 3;
+
+/// A unit under construction at a base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Build {
+    pub kind: UnitKind,
+    /// Turn number at whose start (for the base's holder) the unit rolls out.
+    pub ready: u32,
 }
 
 /// What a player may do on their turn: each unit acts once (move, raise or
-/// found), each held base produces once, then `Pass` ends the turn. The turn
+/// found), each idle held base starts one build, then `Pass` ends the turn. The turn
 /// also ends by itself once the player has nothing legal left to do.
 /// This is the only rules type that crosses the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +130,9 @@ pub enum Action {
         unit: u32,
         dir: Dir,
     },
-    /// New unit at the held base on `at`, or at the first held base with room
-    /// (home first) when `at` is `None`.
+    /// Start building a unit at the held base on `at`, or at the first idle
+    /// held base (home first) when `at` is `None`. It rolls out `BUILD_TURNS`
+    /// turns later.
     Produce {
         kind: UnitKind,
         at: Option<Pos>,
@@ -144,7 +159,7 @@ pub enum ActionError {
     SettlerThere,
     NoBase,
     NotYourBase,
-    NoRoomAtBase,
+    BaseBusy,
     CannotRaiseSettler,
     NotASettler,
     TooCloseToBase,
@@ -165,7 +180,7 @@ impl std::fmt::Display for ActionError {
             ActionError::SettlerThere => "a settler is already there",
             ActionError::NoBase => "you hold no base to produce at",
             ActionError::NotYourBase => "you do not hold that base",
-            ActionError::NoRoomAtBase => "no free cell at your bases",
+            ActionError::BaseBusy => "that base is still building",
             ActionError::CannotRaiseSettler => "settlers cannot be raised",
             ActionError::NotASettler => "only settlers can found a base",
             ActionError::TooCloseToBase => "too close to a base: keep two free tiles between bases",
@@ -188,12 +203,25 @@ pub enum GameOver {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Outcome {
     Moved,
-    AttackerWon { remaining: u32 },
-    DefenderWon { remaining: u32 },
+    AttackerWon {
+        remaining: u32,
+    },
+    DefenderWon {
+        remaining: u32,
+    },
     BothDestroyed,
-    Produced { unit: u32, kind: UnitKind },
-    Founded { base: usize },
-    Raised { unit: u32, strength: u32 },
+    /// A build started; the unit rolls out at the start of turn `ready`.
+    Ordered {
+        kind: UnitKind,
+        ready: u32,
+    },
+    Founded {
+        base: usize,
+    },
+    Raised {
+        unit: u32,
+        strength: u32,
+    },
     Passed,
 }
 
@@ -298,6 +326,7 @@ impl Game {
                 pos,
                 holder: Some(i),
                 acted: false,
+                build: None,
             })
             .collect::<Vec<_>>();
 
@@ -383,10 +412,10 @@ impl Game {
         self.bases.iter().all(|b| b.pos.chebyshev(p) > BASE_GAP)
     }
 
-    /// Whether `player` could produce at the base on `p` right now: they hold
-    /// it, it has not produced this turn, and a cell on or next to it is free.
+    /// Whether `player` could start a build at the base on `p` right now:
+    /// they hold it, it is not building, and it has not acted this turn.
     pub fn can_produce_at(&self, player: usize, p: Pos) -> bool {
-        self.production_spot(player, Some(p)).is_ok()
+        self.build_site(player, Some(p)).is_ok()
     }
 
     pub fn alive_players(&self) -> impl Iterator<Item = usize> + '_ {
@@ -443,7 +472,7 @@ impl Game {
     /// Whether `player` could still do anything this turn besides passing:
     /// a unit with a legal move, raise or found, or a base that can produce.
     pub fn has_moves_left(&self, player: usize) -> bool {
-        self.production_spot(player, None).is_ok()
+        self.build_site(player, None).is_ok()
             || self
                 .units
                 .iter()
@@ -498,65 +527,91 @@ impl Game {
         id
     }
 
-    /// New unit on or next to the chosen held base, or the first held base
-    /// (home first) that has not produced yet and has a free cell. Tanks start
-    /// at strength 1, settlers at 0. New units wait for the next turn.
+    /// Start a unit at the chosen held base, or the first idle held base
+    /// (home first). It rolls out `BUILD_TURNS` turns from now.
     fn produce(
         &mut self,
         me: usize,
         kind: UnitKind,
         at: Option<Pos>,
     ) -> Result<Outcome, ActionError> {
-        let (base, spot) = self.production_spot(me, at)?;
-        let strength = match kind {
-            UnitKind::Tank => 1,
-            UnitKind::Settler => 0,
-        };
-        let unit = self.spawn(kind, me, spot, strength);
-        self.unit_mut(unit).acted = true;
-        if let Some(i) = self.base_at(base) {
-            self.bases[i].acted = true;
-        }
-        Ok(Outcome::Produced { unit, kind })
+        let i = self.build_site(me, at)?;
+        let ready = self.turn + BUILD_TURNS;
+        let base = &mut self.bases[i];
+        base.acted = true;
+        base.build = Some(Build { kind, ready });
+        Ok(Outcome::Ordered { kind, ready })
     }
 
-    /// The base that would produce and the cell the new unit would take.
-    fn production_spot(&self, me: usize, at: Option<Pos>) -> Result<(Pos, Pos), ActionError> {
-        let bases: Vec<Pos> = match at {
-            Some(p) => {
-                let held = self
-                    .base_at(p)
-                    .is_some_and(|i| self.bases[i].holder == Some(me));
-                if !held {
-                    return Err(ActionError::NotYourBase);
-                }
-                vec![p]
-            }
-            None => self.held_bases(me).collect(),
+    /// Index of the base a new build would go to.
+    fn build_site(&self, me: usize, at: Option<Pos>) -> Result<usize, ActionError> {
+        let held: Vec<usize> = if let Some(p) = at {
+            let i = self
+                .base_at(p)
+                .filter(|&i| self.bases[i].holder == Some(me))
+                .ok_or(ActionError::NotYourBase)?;
+            vec![i]
+        } else {
+            // Home base (index `me`) first, then the others in founding order.
+            std::iter::once(me)
+                .chain((0..self.bases.len()).filter(|&i| i != me))
+                .filter(|&i| self.bases[i].holder == Some(me))
+                .collect()
         };
-        if bases.is_empty() {
+        if held.is_empty() {
             return Err(ActionError::NoBase);
         }
-        let ready: Vec<Pos> = bases
-            .into_iter()
-            .filter(|&p| self.base_at(p).is_some_and(|i| !self.bases[i].acted))
-            .collect();
-        if ready.is_empty() {
-            return Err(ActionError::BaseAlreadyActed);
-        }
-        ready
+        if let Some(&i) = held
             .iter()
-            .flat_map(|&base| {
-                std::iter::once(base)
-                    .chain(DIRS.iter().map(move |&d| base.step(d)))
-                    .map(move |p| (base, p))
-            })
-            .find(|&(_, p)| {
-                self.in_bounds(p)
-                    && self.terrain_at(p) == Terrain::Plain
-                    && self.unit_at(p).is_none()
-            })
-            .ok_or(ActionError::NoRoomAtBase)
+            .find(|&&i| !self.bases[i].acted && self.bases[i].build.is_none())
+        {
+            return Ok(i);
+        }
+        if held.iter().all(|&i| self.bases[i].build.is_some()) {
+            Err(ActionError::BaseBusy)
+        } else {
+            Err(ActionError::BaseAlreadyActed)
+        }
+    }
+
+    /// Roll out every finished build of the player whose turn just started,
+    /// on or next to its base. With no free cell it waits for a later turn.
+    /// New units can act straight away.
+    fn deliver_builds(&mut self) {
+        let me = self.current;
+        for i in 0..self.bases.len() {
+            let base = self.bases[i];
+            let Some(build) = base.build.filter(|b| b.ready <= self.turn) else {
+                continue;
+            };
+            if base.holder != Some(me) {
+                continue;
+            }
+            let spot = std::iter::once(base.pos)
+                .chain(DIRS.iter().map(|&d| base.pos.step(d)))
+                .find(|&p| {
+                    self.in_bounds(p)
+                        && self.terrain_at(p) == Terrain::Plain
+                        && self.unit_at(p).is_none()
+                });
+            let name = self.players[me].name.clone();
+            let kind = build.kind;
+            let Some(spot) = spot else {
+                self.log.push(format!(
+                    "{name}'s {} waits for room at its base.",
+                    kind.name()
+                ));
+                continue;
+            };
+            let strength = match kind {
+                UnitKind::Tank => 1,
+                UnitKind::Settler => 0,
+            };
+            let unit = self.spawn(kind, me, spot, strength);
+            self.bases[i].build = None;
+            self.log
+                .push(format!("{name}'s new {} #{unit} rolled out.", kind.name()));
+        }
     }
 
     /// +1 strength for a tank on or orthogonally next to a base `me` holds.
@@ -662,6 +717,7 @@ impl Game {
             pos,
             holder: Some(me),
             acted: true,
+            build: None,
         });
         Ok(Outcome::Founded {
             base: self.bases.len() - 1,
@@ -701,8 +757,10 @@ impl Game {
     fn capture(&mut self, base: usize, by: usize) {
         let from = self.bases[base].holder;
         self.bases[base].holder = Some(by);
-        // A freshly taken base produces from the captor's next turn.
+        // A freshly taken base produces from the captor's next turn, and
+        // whatever the previous holder was building there is lost.
         self.bases[base].acted = true;
+        self.bases[base].build = None;
         let who = &self.players[by].name;
         let msg = match from {
             _ if base == by => format!("{who} took back their home base!"),
@@ -717,6 +775,7 @@ impl Game {
         for b in &mut self.bases {
             if b.holder == Some(player) {
                 b.holder = None;
+                b.build = None;
             }
         }
     }
@@ -795,6 +854,7 @@ impl Game {
                 for b in &mut self.bases {
                     b.acted = false;
                 }
+                self.deliver_builds();
                 return;
             }
         }
@@ -804,8 +864,11 @@ impl Game {
         let name = &self.players[me].name;
         match (action, outcome) {
             (_, Outcome::Passed) => format!("{name} ended their turn."),
-            (_, Outcome::Produced { unit, kind }) => {
-                format!("{name} produced {} #{unit}.", kind.name())
+            (_, Outcome::Ordered { kind, ready }) => {
+                format!(
+                    "{name} started a {}; it rolls out on turn {ready}.",
+                    kind.name()
+                )
             }
             (_, Outcome::Raised { unit, strength }) => {
                 format!("{name} raised {noun} #{unit} to strength {strength}.")
@@ -1100,32 +1163,34 @@ mod tests {
     }
 
     #[test]
-    fn produce_uses_base_then_neighbours() {
+    fn build_rolls_out_after_build_turns_on_base_then_next_to_it() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1); // keeps player 2 in the game
-        let first = g
-            .apply(Action::Produce {
+        assert_eq!(
+            g.apply(Action::Produce {
                 kind: UnitKind::Tank,
                 at: None,
+            }),
+            Ok(Outcome::Ordered {
+                kind: UnitKind::Tank,
+                ready: 1 + BUILD_TURNS,
             })
-            .unwrap();
-        let Outcome::Produced { unit, .. } = first else {
-            panic!()
-        };
-        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
+        );
+        assert!(g.units.iter().all(|u| u.owner != 0), "nothing yet");
         assert_eq!(g.current, 1, "nothing left to do, so the turn passed");
-        g.apply(Action::Pass).unwrap(); // player 2
-        let Outcome::Produced { unit, .. } = g
-            .apply(Action::Produce {
-                kind: UnitKind::Tank,
-                at: None,
-            })
-            .unwrap()
-        else {
-            panic!()
-        };
-        let p = g.unit(unit).unwrap().pos;
-        assert_eq!(p.manhattan(Pos::new(0, 0)), 1);
+        let first = roll_out(&mut g, 0);
+        assert_eq!((g.current, g.turn), (0, 1 + BUILD_TURNS));
+        let u = g.unit(first).unwrap();
+        assert_eq!(u.pos, Pos::new(0, 0));
+        assert!(!u.acted, "a new unit can act at once");
+        // The first tank stays on the base, so the next one rolls out beside it.
+        g.apply(Action::Produce {
+            kind: UnitKind::Tank,
+            at: None,
+        })
+        .unwrap();
+        let second = roll_out(&mut g, 0);
+        assert_eq!(g.unit(second).unwrap().pos.manhattan(Pos::new(0, 0)), 1);
     }
 
     #[test]
@@ -1210,24 +1275,20 @@ mod tests {
     }
 
     #[test]
-    fn captor_produces_at_home_first_then_captured_base() {
+    fn orders_go_home_first_then_to_other_idle_bases() {
         let mut g = arena();
         g.bases[1].holder = Some(0);
         g.spawn_unit(1, Pos::new(3, 3), 1); // keeps player 2 in the game
-                                            // Fill player 1's home and its neighbours.
-        for p in [Pos::new(0, 0), Pos::new(1, 0), Pos::new(0, 1)] {
-            g.spawn_unit(0, p, 1);
-        }
-        let Outcome::Produced { unit, .. } = g
-            .apply(Action::Produce {
+        g.spawn_unit(0, Pos::new(2, 2), 1); // keeps player 1's turn open
+        for _ in 0..2 {
+            g.apply(Action::Produce {
                 kind: UnitKind::Tank,
                 at: None,
             })
-            .unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(5, 5));
+            .unwrap();
+        }
+        assert!(g.bases[0].build.is_some());
+        assert!(g.bases[1].build.is_some());
     }
 
     #[test]
@@ -1270,15 +1331,12 @@ mod tests {
         assert!(g.result.is_none());
         g.apply(Action::Pass).unwrap();
         assert_eq!(g.current, 1);
-        let Outcome::Produced { unit, .. } = g
-            .apply(Action::Produce {
-                kind: UnitKind::Tank,
-                at: None,
-            })
-            .unwrap()
-        else {
-            panic!()
-        };
+        g.apply(Action::Produce {
+            kind: UnitKind::Tank,
+            at: None,
+        })
+        .unwrap();
+        let unit = roll_out(&mut g, 1);
         assert_eq!(g.unit(unit).unwrap().pos, Pos::new(5, 5));
     }
 
@@ -1293,6 +1351,20 @@ mod tests {
         .unwrap();
         assert!(!g.players[1].alive);
         assert_eq!(g.result, Some(GameOver::Winner(0)));
+    }
+
+    /// After `me` ordered a unit: pass turns until it rolls out at the start
+    /// of their turn, and return its id.
+    fn roll_out(g: &mut Game, me: usize) -> u32 {
+        let before = g.units.iter().map(|u| u.id).max().unwrap_or(0);
+        for _ in 0..20 {
+            g.apply(Action::Pass).unwrap();
+            if let Some(u) = g.units.iter().find(|u| u.owner == me && u.id > before) {
+                assert_eq!(g.current, me, "rolls out at the start of the owner's turn");
+                return u.id;
+            }
+        }
+        panic!("build never rolled out");
     }
 
     /// Make every base neutral so losing units is what decides elimination.
@@ -1310,18 +1382,14 @@ mod tests {
     fn produce_settler_has_zero_strength_and_cannot_be_raised() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(5, 5), 1);
-        let Outcome::Produced { unit, kind } = g
-            .apply(Action::Produce {
-                kind: UnitKind::Settler,
-                at: None,
-            })
-            .unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(kind, UnitKind::Settler);
-        assert_eq!(g.unit(unit).unwrap().strength, 0);
-        g.apply(Action::Pass).unwrap(); // player 2; player 1 passed automatically
+        g.apply(Action::Produce {
+            kind: UnitKind::Settler,
+            at: None,
+        })
+        .unwrap();
+        let unit = roll_out(&mut g, 0);
+        let u = g.unit(unit).unwrap();
+        assert_eq!((u.kind, u.strength), (UnitKind::Settler, 0));
         assert_eq!(
             g.apply(Action::Raise { unit }),
             Err(ActionError::CannotRaiseSettler)
@@ -1336,19 +1404,15 @@ mod tests {
             pos: Pos::new(3, 0),
             holder: Some(0),
             acted: false,
+            build: None,
         });
-        let Outcome::Produced { unit, .. } = g
-            .apply(Action::Produce {
-                kind: UnitKind::Tank,
-                at: Some(Pos::new(3, 0)),
-            })
-            .unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(3, 0));
-        g.apply(Action::Pass).unwrap();
-        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Produce {
+            kind: UnitKind::Tank,
+            at: Some(Pos::new(3, 0)),
+        })
+        .unwrap();
+        assert!(g.bases[2].build.is_some());
+        assert!(g.bases[0].build.is_none(), "home base untouched");
         assert_eq!(
             g.apply(Action::Produce {
                 kind: UnitKind::Tank,
@@ -1374,6 +1438,7 @@ mod tests {
                 pos: Pos::new(3, 0),
                 holder: Some(0),
                 acted: true,
+                build: None,
             }
         );
     }
@@ -1497,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn each_base_produces_once_per_turn_and_new_units_wait() {
+    fn each_base_builds_one_unit_at_a_time() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(3, 3), 1);
         g.spawn_unit(0, Pos::new(2, 4), 1); // keeps player 1's turn open
@@ -1505,39 +1570,34 @@ mod tests {
             pos: Pos::new(3, 0),
             holder: Some(0),
             acted: false,
+            build: None,
         });
         let tank = Action::Produce {
             kind: UnitKind::Tank,
             at: None,
         };
-        let Outcome::Produced { unit, .. } = g.apply(tank).unwrap() else {
-            panic!()
+        let home = Action::Produce {
+            kind: UnitKind::Tank,
+            at: Some(Pos::new(0, 0)),
         };
-        assert_eq!(g.unit(unit).unwrap().pos, Pos::new(0, 0));
-        assert_eq!(
-            g.apply(Action::Raise { unit }),
-            Err(ActionError::UnitAlreadyActed)
-        );
-        assert_eq!(
-            g.apply(Action::Produce {
-                kind: UnitKind::Tank,
-                at: Some(Pos::new(0, 0)),
-            }),
-            Err(ActionError::BaseAlreadyActed)
-        );
-        let Outcome::Produced { unit: second, .. } = g.apply(tank).unwrap() else {
-            panic!()
-        };
-        assert_eq!(g.unit(second).unwrap().pos, Pos::new(3, 0));
-        assert_eq!(g.apply(tank), Err(ActionError::BaseAlreadyActed));
-        g.apply(Action::Pass).unwrap();
-        g.apply(Action::Pass).unwrap();
-        g.apply(Action::Raise { unit }).unwrap();
         g.apply(tank).unwrap();
+        assert_eq!(g.apply(home), Err(ActionError::BaseBusy));
+        g.apply(tank).unwrap();
+        assert!(
+            g.bases[2].build.is_some(),
+            "second order went to the other base"
+        );
+        assert_eq!(g.apply(tank), Err(ActionError::BaseBusy));
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(g.apply(home), Err(ActionError::BaseBusy), "still building");
+        roll_out(&mut g, 0);
+        assert_eq!(g.units.iter().filter(|u| u.owner == 0).count(), 3);
+        g.apply(home).unwrap();
     }
 
     #[test]
-    fn can_produce_at_tracks_holder_use_and_room() {
+    fn can_produce_at_tracks_holder_use_and_build() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(3, 3), 1);
         g.spawn_unit(0, Pos::new(2, 4), 1); // keeps player 1's turn open
@@ -1550,13 +1610,64 @@ mod tests {
             at: Some(home),
         })
         .unwrap();
-        assert!(!g.can_produce_at(0, home), "already produced");
+        assert!(!g.can_produce_at(0, home), "already ordered");
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        assert!(!g.can_produce_at(0, home), "still building");
 
+        // A crowded base can still take an order; the unit waits for room.
         let mut full = arena();
         for p in [home, Pos::new(1, 0), Pos::new(0, 1)] {
             full.spawn_unit(1, p, 1);
         }
-        assert!(!full.can_produce_at(0, home), "no free cell");
+        assert!(full.can_produce_at(0, home));
+    }
+
+    #[test]
+    fn finished_build_waits_for_a_free_cell() {
+        let mut g = arena();
+        g.spawn_unit(1, Pos::new(5, 0), 1);
+        let blockers: Vec<u32> = [Pos::new(0, 0), Pos::new(1, 0), Pos::new(0, 1)]
+            .into_iter()
+            .map(|p| g.spawn_unit(0, p, 1))
+            .collect();
+        g.bases[0].build = Some(Build {
+            kind: UnitKind::Tank,
+            ready: 2,
+        });
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        assert_eq!(g.turn, 2);
+        assert!(g.bases[0].build.is_some(), "no room yet");
+        assert!(g.log.iter().any(|l| l.contains("waits for room")));
+        g.apply(Action::Move {
+            unit: blockers[1],
+            dir: Dir::Right,
+        })
+        .unwrap();
+        g.apply(Action::Pass).unwrap();
+        g.apply(Action::Pass).unwrap();
+        assert!(g.bases[0].build.is_none());
+        assert_eq!(g.unit_at(Pos::new(1, 0)).unwrap().owner, 0);
+        assert_eq!(g.units.iter().filter(|u| u.owner == 0).count(), 4);
+    }
+
+    #[test]
+    fn capturing_a_base_loses_its_build() {
+        let mut g = arena();
+        g.bases[1].build = Some(Build {
+            kind: UnitKind::Tank,
+            ready: 3,
+        });
+        let a = g.spawn_unit(0, Pos::new(4, 5), 3);
+        g.spawn_unit(1, Pos::new(0, 5), 1);
+        g.apply(Action::Move {
+            unit: a,
+            dir: Dir::Right,
+        })
+        .unwrap();
+        assert_eq!(g.bases[1].holder, Some(0));
+        assert!(g.bases[1].build.is_none());
     }
 
     #[test]
@@ -1639,10 +1750,15 @@ mod tests {
     }
 
     #[test]
-    fn boxed_in_units_and_full_bases_count_as_nothing_left() {
+    fn boxed_in_units_and_busy_bases_count_as_nothing_left() {
         let mut g = arena();
         g.spawn_unit(1, Pos::new(3, 3), 1);
-        // Home (0,0) and both free neighbours are taken by player 1's units.
+        // Home (0,0) is busy building and both free neighbours are taken by
+        // player 1's units.
+        g.bases[0].build = Some(Build {
+            kind: UnitKind::Tank,
+            ready: 9,
+        });
         let a = g.spawn_unit(0, Pos::new(0, 0), 1);
         g.spawn_unit(0, Pos::new(1, 0), 1);
         g.spawn_unit(0, Pos::new(0, 1), 1);

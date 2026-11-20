@@ -38,19 +38,23 @@ Shortcuts: `--connect HOST:PORT --name NAME --host CODE` or `--join CODE` connec
 ## Rules
 
 - A map is generated (plains and impassable water) and every player gets a base with one tank.
-- Players act in order. Each turn every unit acts once and every base you hold produces once.
+- Players act in order. Each turn every unit acts once and every idle base you hold can start a build.
   Exactly one thing blinks: the selected unit, or the selected base once your units are done.
   Click a unit or base, or press Tab to cycle through what can still act:
   - **Move** a selected tank one cell (arrows / WASD).
   - **Produce** a tank of strength 1 (P) or a settler (E) at a base you hold: the selected
     base, else a held base under the cursor, else your home base first, then the others.
+    Building takes 3 turns: ordered on turn 5, the unit rolls out at the start of your turn 8,
+    on or next to the base, and can act at once. A base builds one unit at a time (its tile
+    shows e.g. `T2`: a tank, 2 turns left). If every cell there is taken, the unit waits for
+    room. A base that is captured loses its build.
   - **Found** a base with the selected settler (F): the settler becomes a base on its tile.
     Every base needs two free tiles to every other base, diagonals included.
   - **Raise** a selected tank's strength by 1 (R) while it stands on or next to (not diagonally)
     a base you hold. Settlers cannot be raised.
   - Space ends your turn. It also ends by itself once none of your units or bases can do
     anything, and a player who cannot do anything at all is skipped. Spent units are dimmed;
-    new units and bases you just captured or founded wait for your next turn. `M` returns to
+    bases you just captured or founded start building from your next turn. `M` returns to
     the menu.
 - Moving onto an enemy tank fights: the stronger tank survives with the difference in strength.
   Equal strength destroys both.
